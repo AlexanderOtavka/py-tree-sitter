@@ -47,6 +47,7 @@ Note
 Template strings require Python 3.14 or newer.
 """
 
+from ._edits import Edits, OverlappingEditError
 from ._errors import TemplateCompileError, TemplateError, TemplateSyntaxError
 from ._holes import (
     Alternatives,
@@ -73,8 +74,11 @@ __all__ = [
     "Wildcard",
     "AnyChildren",
     "Alternatives",
+    # Source rewriting
+    "Edits",
     # Errors
     "TemplateError",
     "TemplateSyntaxError",
     "TemplateCompileError",
+    "OverlappingEditError",
 ]

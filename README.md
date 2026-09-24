@@ -345,6 +345,34 @@ literal — that is what makes an anchored regex like `^aws_s3` behave as expect
 Template strings require Python 3.14. See [examples/template_queries.py] for
 runnable examples across HCL, Python and JSON.
 
+### Rewriting source at matched nodes
+
+Captures are plain `Node`s, so you have the byte offsets needed to edit the
+source — but doing it by hand corrupts output *silently*: splicing one match
+invalidates every later offset, `start_byte` counts bytes rather than characters,
+and nothing stops you editing a node and something nested inside it.
+
+`Edits` batches the edits and applies them safely:
+
+```python
+from tree_sitter.template import Edits
+
+edits = Edits(source)
+for match in q.matches(source):
+    edits.replace(match["name"], "prod_" + match.text("name"))
+new_source = edits.apply()
+```
+
+Queue in any order, including plain source order; `apply()` sorts descending
+internally, does the encode/decode exactly once, and raises
+`OverlappingEditError` rather than producing quietly wrong text. Also available:
+`insert_before`, `insert_after`, `delete`, and `replace_all` for a quantified
+capture's `match.all(name)`. `str` in gives `str` out, `bytes` gives `bytes`, and
+`apply()` is non-destructive so the object stays reusable.
+
+This module knows nothing about template queries — it takes plain `Node`s, so it
+works just as well with a hand-written S-expression `Query` or a manual tree walk.
+
 To try out and explore the code referenced in this README, check out [examples/usage.py].
 
 [tree-sitter]: https://tree-sitter.github.io/tree-sitter/
