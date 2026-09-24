@@ -295,6 +295,56 @@ assert matches[1][1]["function.args"] == [function_call_args_node]
 The difference between the two methods is that `QueryCursor.matches()` groups captures into matches,
 which is much more useful when your captures within a query relate to each other.
 
+### Template queries
+
+Writing S-expressions by hand means learning a second syntax for a language you
+already know. `tree_sitter.template` lets you write the query as an *example* of
+the code you want to match, in that language's own syntax, using a [template
+string] — and marks the interesting parts with interpolations:
+
+```python
+from tree_sitter import Language
+from tree_sitter.template import query, capture
+import tree_sitter_hcl
+
+HCL = Language(tree_sitter_hcl.language())
+
+q = query(HCL, t'''
+    resource "aws_s3_bucket" "{capture("name")}" {{
+      acl = "private"
+      {...}
+    }}
+''')
+
+for match in q.matches(terraform_source):
+    print(match.text("name"))
+```
+
+The template is parsed with the very same grammar the query runs against, so
+there is no per-language translation logic: whatever the grammar can parse, you
+can write a query in. Inspect `q.sexp` to see the S-expression it generated.
+
+| interpolation | meaning |
+|---|---|
+| `capture("n")` | capture the node at this position as `@n` |
+| `capture("n", "string_lit")` | capture, requiring a node type |
+| `capture("n", pattern=r"^aws_")` | capture, constrained by a regular expression |
+| `capture("n", one_of=[...])` | capture, constrained to literal alternatives |
+| `capture("n", quantifier="*")` | capture a repeated run of nodes |
+| `anything()` | match one node of any type, without capturing |
+| `...` | allow additional unmatched siblings here |
+| `"some string"` | splice literal source text into the template |
+
+A template matches **exactly** by default: a block with one attribute will not
+match a block with two. Use `...` wherever extra children should be tolerated.
+Comments in the matched source never cost you a match.
+
+Put a hole *inside* quotes to capture a string's contents rather than the quoted
+literal — that is what makes an anchored regex like `^aws_s3` behave as expected.
+
+Template strings require Python 3.14. See [examples/template_queries.py] for
+runnable examples across HCL, Python and JSON.
+
 To try out and explore the code referenced in this README, check out [examples/usage.py].
 
 [tree-sitter]: https://tree-sitter.github.io/tree-sitter/
@@ -306,3 +356,5 @@ To try out and explore the code referenced in this README, check out [examples/u
 [docs]: https://img.shields.io/github/deployments/tree-sitter/py-tree-sitter/github-pages?logo=sphinx&label=Docs
 [examples/walk_tree.py]: https://github.com/tree-sitter/py-tree-sitter/blob/master/examples/walk_tree.py
 [examples/usage.py]: https://github.com/tree-sitter/py-tree-sitter/blob/master/examples/usage.py
+[examples/template_queries.py]: https://github.com/tree-sitter/py-tree-sitter/blob/master/examples/template_queries.py
+[template string]: https://peps.python.org/pep-0750/
