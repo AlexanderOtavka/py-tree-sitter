@@ -901,5 +901,111 @@ class TestAnythingKind(TemplateQueryTestBase):
         self.assertEqual({}, match.captures)
 
 
+class TestChildOrder(TemplateQueryTestBase):
+    """Child order is significant, and ``...`` never relaxes it.
+
+    A tree-sitter pattern matches its children *in sequence*, so the order a
+    template lists children in is the order they must appear. That is inherent to
+    the query language, not something the anchors add: verified by building the
+    same pattern with and without anchors -- both reject a reversed body.
+
+    Anchors control *adjacency* instead (no gaps, no extra siblings), which is
+    what ``...`` relaxes. So ``...`` changes how many other children may sit
+    around the named ones, never their relative order.
+    """
+
+    ONE_TWO = 'resource "a" "b" {\n  k1 = 1\n  k2 = 2\n}\n'
+    TWO_ONE = 'resource "a" "b" {\n  k2 = 2\n  k1 = 1\n}\n'
+
+    def test_attribute_order_is_significant(self):
+        q = query(self.hcl, t'resource "a" "b" {{\n  k1 = 1\n  k2 = 2\n}}')
+        self.assertEqual(1, len(q.matches(self.ONE_TWO)))
+        self.assertEqual([], q.matches(self.TWO_ONE))
+
+    def test_ellipsis_does_not_relax_order(self):
+        """The subtle one: `...` adds tolerance for *extra* children only."""
+        q = query(self.hcl, t'resource "a" "b" {{\n  k1 = 1\n  k2 = 2\n  {...}\n}}')
+        self.assertEqual(1, len(q.matches(self.ONE_TWO)))
+        self.assertEqual([], q.matches(self.TWO_ONE))
+
+    def test_ellipsis_admits_extras_before_between_and_after(self):
+        q = query(self.hcl, t'resource "a" "b" {{\n  k1 = 1\n  k2 = 2\n  {...}\n}}')
+        for label, source in (
+            ("after", 'resource "a" "b" {\n  k1 = 1\n  k2 = 2\n  z = 9\n}\n'),
+            ("before", 'resource "a" "b" {\n  z = 9\n  k1 = 1\n  k2 = 2\n}\n'),
+            ("between", 'resource "a" "b" {\n  k1 = 1\n  z = 9\n  k2 = 2\n}\n'),
+        ):
+            with self.subTest(extra=label):
+                self.assertEqual(1, len(q.matches(source)))
+
+    def test_single_attribute_with_ellipsis_matches_at_any_position(self):
+        """One named child has no relative order to preserve, so it floats."""
+        q = query(self.hcl, t'resource "a" "b" {{\n  key = "v"\n  {...}\n}}')
+        self.assertEqual(1, len(q.matches('resource "a" "b" {\n  key = "v"\n  z = 9\n}\n')))
+        self.assertEqual(1, len(q.matches('resource "a" "b" {\n  z = 9\n  key = "v"\n}\n')))
+
+    def test_json_member_order_is_significant(self):
+        q = query(self.json, t'{{"a": 1, "b": 2, {...}}}')
+        self.assertEqual(1, len(q.matches('{"a": 1, "b": 2}')))
+        self.assertEqual(1, len(q.matches('{"a": 1, "z": 9, "b": 2}')))
+        self.assertEqual(1, len(q.matches('{"z": 9, "a": 1, "b": 2}')))
+        self.assertEqual([], q.matches('{"b": 2, "a": 1}'))
+
+    def test_python_statement_order_is_significant(self):
+        q = query(self.python, t"def f():\n    a = 1\n    b = 2")
+        self.assertEqual(1, len(q.matches("def f():\n    a = 1\n    b = 2\n")))
+        self.assertEqual([], q.matches("def f():\n    b = 2\n    a = 1\n"))
+
+
+class TestTemplateComments(TemplateQueryTestBase):
+    """A comment in the *template* is ignored entirely.
+
+    Template comments are documentation for whoever reads the query, so they are
+    dropped: they neither become part of the pattern nor require the matched
+    source to carry a comment. (Separately, a comment in the *matched source* does
+    not cost a match -- see TestCommentTolerance.)
+    """
+
+    def commented(self):
+        return query(
+            self.hcl,
+            t'resource "a" "{capture("n")}" {{\n  # why we pin this\n  key = "v"  # note\n}}',
+        )
+
+    def uncommented(self):
+        return query(self.hcl, t'resource "a" "{capture("n")}" {{\n  key = "v"\n}}')
+
+    def test_commented_template_generates_the_same_query(self):
+        self.assertEqual(self.uncommented().sexp, self.commented().sexp)
+
+    def test_comment_text_never_reaches_the_query(self):
+        sexp = self.commented().sexp
+        for word in ("why", "pin", "note"):
+            with self.subTest(word=word):
+                self.assertNotIn(word, sexp)
+
+    def test_commented_template_matches_uncommented_source(self):
+        q = self.commented()
+        matches = q.matches('resource "a" "x" {\n  key = "v"\n}\n')
+        self.assertEqual(["x"], self.texts(matches, "n"))
+
+    def test_commented_template_does_not_require_a_matching_comment(self):
+        """An unrelated comment in the source is fine -- the text is not compared."""
+        q = self.commented()
+        source = 'resource "a" "y" {\n  # something else entirely\n  key = "v"\n}\n'
+        self.assertEqual(["y"], self.texts(q.matches(source), "n"))
+
+    def test_commented_template_still_rejects_a_wrong_value(self):
+        """Dropping the comment must not also drop the surrounding constraints."""
+        q = self.commented()
+        self.assertEqual([], q.matches('resource "a" "z" {\n  key = "other"\n}\n'))
+
+    def test_python_template_comment_is_ignored(self):
+        commented = query(self.python, t"def f():\n    # a note\n    return 1")
+        plain = query(self.python, t"def f():\n    return 1")
+        self.assertEqual(plain.sexp, commented.sexp)
+        self.assertEqual(1, len(commented.matches("def f():\n    return 1\n")))
+
+
 if __name__ == "__main__":
     unittest.main()
