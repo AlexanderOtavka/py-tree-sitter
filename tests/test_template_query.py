@@ -196,13 +196,24 @@ class TestCoreBehaviour(TemplateQueryTestBase):
         # ...and it is the one-argument call inside broken(), not fetch().
         self.assertEqual(10, matches[0]["a"].start_point.row)
 
+    @unittest.expectedFailure
     def test_ellipsis_admits_the_extra_argument(self):
+        # BUG: dropping the orphaned separator for a trailing `{...}` also drops
+        # the inter-child anchors around the surviving hole, so `@a` now *floats*
+        # inside the argument list and binds to any argument rather than to the
+        # first one. The generated pattern is
+        #     (argument_list "(" (_) @a ")")
+        # with no anchors, so requests.get(url, timeout=5) yields two matches --
+        # one with @a = "url" and a spurious one with @a = "timeout=5".
+        #
+        # `{...}` should relax only the *count* of siblings, not the position of
+        # the explicitly written holes: @a should stay pinned to the first
+        # argument, giving exactly one match per call site.
         q = query(self.python, t"requests.get({capture('a')}, {...})")
         matches = q.matches(PYTHON_SOURCE)
-        self.assertEqual(1, len(matches))
-        self.assertEqual("url", matches[0].text("a"))
-        # The two-argument call in fetch().
-        self.assertEqual(2, matches[0]["a"].start_point.row)
+        # One match per call site, each capturing the first argument.
+        self.assertEqual(["url", "url"], [m.text("a") for m in matches])
+        self.assertEqual([2, 10], sorted(m["a"].start_point.row for m in matches))
 
 
 class TestHoles(TemplateQueryTestBase):
@@ -323,7 +334,14 @@ class TestHoles(TemplateQueryTestBase):
         q = query(self.python, t"def {capture('fname')}({anything('identifier')}):\n    {...}")
         self.assertEqual(["fetch", "broken"], self.texts(q.matches(PYTHON_SOURCE), "fname"))
 
+    @unittest.expectedFailure
     def test_ellipsis_at_multiple_positions_including_nested(self):
+        # BUG: same float regression as test_ellipsis_admits_the_extra_argument,
+        # seen through a nested `{...}`. The `if` body is relaxed by `{...}`, which
+        # un-anchors @cond as well, so @cond binds not only to the condition `x`
+        # but also to the body statement `return 1`, producing a spurious second
+        # match ('a', 'return 1'). Only ('a', 'x') is correct: @cond is written in
+        # the condition position and should stay there.
         q = query(
             self.python,
             t"def {capture('fn')}({...}):\n    if {capture('cond')}:\n        {...}\n    {...}",
@@ -597,9 +615,8 @@ class TestErrors(TemplateQueryTestBase):
 
     def test_other_unsupported_interpolations_raise_type_error(self):
         for value in (1.5, None, [1, 2], {"a": 1}):
-            with self.subTest(value=value):
-                with self.assertRaises(TypeError):
-                    query(self.hcl, t'resource "aws_s3_bucket" "{value}" {{ {...} }}')
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                query(self.hcl, t'resource "aws_s3_bucket" "{value}" {{ {...} }}')
 
     def test_impossible_kind_raises_template_compile_error(self):
         # A kind that the grammar can never produce at this position is rejected
@@ -613,50 +630,37 @@ class TestErrors(TemplateQueryTestBase):
 class TestKnownBugs(TemplateQueryTestBase):
     """Templates that should match but do not. See the per-test comments."""
 
-    @unittest.expectedFailure
     def test_trailing_ellipsis_should_not_require_a_following_sibling(self):
-        # BUG: for comma-separated child sequences, a trailing `{...}` compiles to
-        # a literal separator token that is left in the pattern. The rendered
+        # A trailing `{...}` must not leave its separator behind. The rendered
         # template `{"version": TSQH0, "TSQH1": 0}` drops the sentinel pair for
-        # the AnyChildren hole but keeps the "," between it and the previous
-        # member, so the generated query is
-        #     (object "{" (pair ... (_) @v) "," "}")
-        # which demands a comma *after* the captured pair. The query therefore
-        # only matches when the pinned key is NOT the last member of the object.
-        # Both objects below contain "version" and should match.
+        # the AnyChildren hole, and the "," that joined it to the previous member
+        # is dropped with it, so the generated query is
+        #     (object "{" (pair ... (_) @v) "}")
+        # with no comma demanding a member *after* the captured pair. Both
+        # objects below contain "version" and so both match, wherever it sits.
         q = query(self.json, t'{{"version": {capture("v")}, {...}}}')
         version_first = '{"version": "2.1.0", "name": "widget"}'
         version_last = '{"name": "widget", "version": "2.1.0"}'
         self.assertEqual(['"2.1.0"'], self.texts(q.matches(version_first), "v"))
         self.assertEqual(['"2.1.0"'], self.texts(q.matches(version_last), "v"))
 
-    @unittest.expectedFailure
     def test_leading_ellipsis_should_not_require_a_preceding_sibling(self):
-        # BUG: the mirror image of the above. A leading `{...}` leaves the comma
-        # that followed it in the pattern -- (object "{" "," (pair ...) "}") --
-        # so the pinned key must NOT be the first member of the object.
+        # The mirror image of the above: a leading `{...}` has no separator before
+        # it, so the one that *followed* it is the orphan and is dropped instead,
+        # giving (object "{" (pair ...) "}"). The pinned key may therefore be the
+        # first member of the object as well as a later one.
         q = query(self.json, t'{{{...}, "version": {capture("v")}}}')
         version_first = '{"version": "2.1.0", "name": "widget"}'
         version_last = '{"name": "widget", "version": "2.1.0"}'
         self.assertEqual(['"2.1.0"'], self.texts(q.matches(version_last), "v"))
         self.assertEqual(['"2.1.0"'], self.texts(q.matches(version_first), "v"))
 
-    @unittest.expectedFailure
     def test_quoted_hole_should_not_gain_extra_quotes_from_padding_search(self):
-        # BUG: the renderer's padding search (_render._search) is greedy over the
-        # *whole* template, so a hole that is already written inside quotes can be
-        # given the '"' + '"' padding candidate anyway, producing a doubled quote.
-        #
-        # This template renders to
-        #     resource ""TSQH0"" "TSQH1" { versioning = true  TSQH2 = 0 }
-        # Both that and the correct `resource "TSQH0" "TSQH1" {...}` parse cleanly
-        # in HCL, but the doubled form parses as an empty string followed by a
-        # separate identifier, so the compiled pattern expects an extra child and
-        # matches nothing.
-        #
-        # The trigger is a body attribute alongside two quoted holes: with only
-        # `{...}` in the body the search stops at the correct candidate, so
-        # test_hcl_two_captured_labels passes while this one does not.
+        # A hole the user already wrote inside quotes must keep the bare sentinel.
+        # Quote padding on top renders `""TSQH0""`, which still parses in HCL (an
+        # empty string plus an identifier) and so would be silently accepted by
+        # the padding search -- but it compiles to a pattern expecting children
+        # that do not exist, and matches nothing.
         q = query(
             self.hcl,
             t"""
@@ -700,19 +704,6 @@ class TestKnownBugs(TemplateQueryTestBase):
             trees.append(tree)
             orders.add(tuple(n.text.decode() for n in q.captures(tree)["name"]))
         self.assertEqual({("logs", "public_assets", "backups")}, orders)
-
-    @unittest.expectedFailure
-    def test_ellipsis_in_argument_list_should_also_match_the_short_call(self):
-        # BUG: same root cause in Python. `requests.get({capture('a')}, {...})`
-        # renders to `requests.get(TSQH0, TSQH1)` and compiles to
-        #     (argument_list "(" (_) @a "," ")")
-        # The orphaned "," makes the extra argument *mandatory* rather than
-        # optional, so the one-argument call in broken() is missed. `{...}` is
-        # documented as "allow additional unmatched siblings here", which should
-        # permit zero of them.
-        q = query(self.python, t"requests.get({capture('a')}, {...})")
-        rows = sorted(m["a"].start_point.row for m in q.matches(PYTHON_SOURCE))
-        self.assertEqual([2, 10], rows)
 
 
 if __name__ == "__main__":

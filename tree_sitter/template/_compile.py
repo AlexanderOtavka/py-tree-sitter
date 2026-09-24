@@ -146,6 +146,46 @@ def _non_extra_children(node: Node) -> list[Node]:
     return [c for c in node.children if not c.is_extra]
 
 
+def orphaned_separators(children: list[Node], holes: set[int]) -> set[int]:
+    """Indices of separator children left dangling by removed ``AnyChildren`` holes.
+
+    A hole's subtree is dropped from the pattern, but the punctuation that
+    attached it to its neighbours is a sibling in its own right and would survive
+    -- turning the "extra children are allowed here" hole into a demand for them.
+    ``f(a, {...})`` would compile to ``(argument_list "(" (_) @a "," ")")``, whose
+    trailing comma only matches a call that really has a second argument.
+
+    A *separator* is derived positionally rather than from a per-grammar list of
+    punctuation: an anonymous child that sits strictly *between* two other
+    children. That excludes structural delimiters, which are the first and last
+    children of the sequence (``"("``/``")"`` of an ``argument_list``,
+    ``"{"``/``"}"`` of a JSON ``object``) and must be kept -- and it naturally
+    covers grammars that separate with ``;`` or ``|`` instead of ``,``.
+
+    Each hole orphans at most *one* separator, so a hole in the middle
+    (``f(a, {...}, b)``) still leaves the single comma that joins its surviving
+    neighbours. The preceding separator is dropped by preference, with the
+    following one as the fallback -- which is what makes a hole at the start of a
+    sequence give up the separator after it instead. A hole that is a sequence's
+    only real child (``f({...})``) sits between two delimiters and so orphans
+    nothing.
+    """
+    if not holes:
+        return set()
+    last = len(children) - 1
+
+    def is_separator(index: int) -> bool:
+        return 0 < index < last and index not in holes and not children[index].is_named
+
+    dropped: set[int] = set()
+    for hole in sorted(holes):
+        for candidate in (hole - 1, hole + 1):
+            if candidate not in dropped and is_separator(candidate):
+                dropped.add(candidate)
+                break
+    return dropped
+
+
 def _slot_node(root: Node, start: int, end: int) -> Node | None:
     """Return the outermost non-extra node fully contained in ``[start, end)``.
 
@@ -317,14 +357,21 @@ class _Compiler:
         if not node.is_named:
             return AnonNode(text=self._text(node))
 
+        raw = _non_extra_children(node)
+        holes = {
+            i
+            for i, child in enumerate(raw)
+            if isinstance(getattr(self.targets.get(child.id), "hole", None), AnyChildren)
+        }
+        # An AnyChildren hole is emitted as nothing, so the separator that joined
+        # it to its neighbours has to go with it -- otherwise the "extra children
+        # allowed here" hole silently demands them. See orphaned_separators.
+        skip = holes | orphaned_separators(raw, holes)
+        anchored = not holes
+
         children: list[Sexp] = []
-        anchored = True
-        for child in node.children:
-            if child.is_extra:
-                continue
-            child_slot = self.targets.get(child.id)
-            if child_slot is not None and isinstance(child_slot.hole, AnyChildren):
-                anchored = False
+        for i, child in enumerate(raw):
+            if i in skip:
                 continue
             compiled = self.compile_node(child)
             if compiled is not None:

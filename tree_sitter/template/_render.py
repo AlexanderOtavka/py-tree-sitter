@@ -249,6 +249,35 @@ def _assemble(
     return "".join(chunks), spans
 
 
+#: Quote characters that, when they already surround a hole in the template,
+#: make the quote-adding padding candidates wrong.
+_QUOTES = ("\"", "'", "`")
+
+
+def _allowed_candidates(literals: list[str], index: int) -> list[int]:
+    """Return the padding candidates worth trying for hole *index*.
+
+    A hole the user already wrote inside quotes -- ``"{capture('name')}"`` --
+    must not be given quote padding on top, or the template renders as
+    ``""TSQH0""``. That still *parses* in HCL (an empty string followed by an
+    identifier), so the search would happily accept it and then compile a
+    pattern expecting children that do not exist. Excluding the candidate is
+    more robust than trying to detect the damage afterwards.
+    """
+    before = literals[index]
+    after = literals[index + 1] if index + 1 < len(literals) else ""
+    quoted = before.endswith(_QUOTES) and after.startswith(_QUOTES)
+
+    candidates = list(range(len(PAD_CANDIDATES)))
+    if quoted:
+        # Inside quotes the sentinel is already in a valid position, so the only
+        # sensible candidate is the bare one. Anything else -- extra quotes, or
+        # trailing syntax like ` = 0` -- lands *inside* the string literal, where
+        # it becomes part of the text rather than structure.
+        candidates = [c for c in candidates if PAD_CANDIDATES[c] == ("", "")]
+    return candidates
+
+
 def _search(literals: list[str], slots: list[HoleSlot], parser: Parser) -> list[int]:
     """Find a padding candidate per hole that makes the whole template parse.
 
@@ -258,6 +287,7 @@ def _search(literals: list[str], slots: list[HoleSlot], parser: Parser) -> list[
     later one.
     """
     candidates = [0] * len(slots)
+    allowed = [_allowed_candidates(literals, i) for i in range(len(slots))]
 
     def score(cands: list[int]) -> tuple[tuple[int, int], str]:
         text, _ = _assemble(literals, slots, cands)
@@ -271,7 +301,7 @@ def _search(literals: list[str], slots: list[HoleSlot], parser: Parser) -> list[
         for i in range(len(slots)):
             original = candidates[i]
             local_best, local_cand = best, original
-            for cand in range(len(PAD_CANDIDATES)):
+            for cand in allowed[i]:
                 if cand == original:
                     continue
                 candidates[i] = cand

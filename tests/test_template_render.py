@@ -63,6 +63,36 @@ class TestTemplateRender(TestCase):
         self.assertEqual("TSQH0 = 0", self.slot_text(result, 0))
         self.assertIn("TSQH0 = 0", result.text)
 
+    def test_hole_already_inside_quotes_keeps_the_bare_sentinel(self):
+        """Quote padding must not be added to a hole the user already quoted.
+
+        ``""TSQH0""`` parses cleanly in HCL -- an empty string followed by an
+        identifier -- so the padding search would accept it, then compile a
+        pattern expecting children that do not exist.
+        """
+        result = render(
+            t"""
+            resource "{capture("type")}" "{capture("name")}" {{
+              versioning = true
+              {...}
+            }}
+            """,
+            self.hcl,
+        )
+        self.assert_clean(self.hcl, result)
+        self.assertIn('resource "TSQH0" "TSQH1"', result.text)
+        self.assertNotIn('""', result.text)
+        for index in (0, 1):
+            self.assertEqual("", result.slots[index].pad_prefix)
+            self.assertEqual("", result.slots[index].pad_suffix)
+            self.assertEqual(f"TSQH{index}", self.slot_text(result, index))
+
+    def test_quoted_hole_in_json_keeps_the_bare_sentinel(self):
+        result = render(t'{{"{capture("key")}": 1}}', self.json)
+        self.assert_clean(self.json, result)
+        self.assertIn('"TSQH0": 1', result.text)
+        self.assertEqual("TSQH0", self.slot_text(result, 0))
+
     def test_hcl_block_label_uses_bare_sentinel(self):
         result = render(
             t"""
