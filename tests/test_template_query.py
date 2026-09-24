@@ -9,6 +9,7 @@ import unittest
 from unittest import TestCase
 
 import tree_sitter_hcl
+import tree_sitter_html
 import tree_sitter_javascript
 import tree_sitter_json
 import tree_sitter_python
@@ -81,6 +82,7 @@ class TemplateQueryTestBase(TestCase):
         cls.json = Language(tree_sitter_json.language())
         cls.javascript = Language(tree_sitter_javascript.language())
         cls.rust = Language(tree_sitter_rust.language())
+        cls.html = Language(tree_sitter_html.language())
 
     def texts(self, matches, name):
         """Capture texts for ``name``, one entry per match."""
@@ -697,10 +699,6 @@ class TestKnownBugs(TemplateQueryTestBase):
         self.assertEqual({("logs", "public_assets", "backups")}, orders)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestQuantifiers(TemplateQueryTestBase):
     """``*``/``+`` captures must span a separated list.
 
@@ -851,3 +849,57 @@ class TestEllipsisKeepsSiblingsInPlace(TemplateQueryTestBase):
         q = query(self.hcl, t'resource "a" "b" {{\n  k = 1\n  {...}\n}}')
         self.assertEqual(1, len(q.matches('resource "a" "b" {\n  k = 1\n}\n')))
         self.assertEqual(1, len(q.matches('resource "a" "b" {\n  k = 1\n  z = 2\n}\n')))
+
+
+class TestHtml(TemplateQueryTestBase):
+    """HTML exercises a grammar whose closing delimiter (``end_tag``) is *named*.
+
+    An extras run with no anchor after it lets any sibling slide through, which is
+    invisible in grammars whose delimiters are anonymous.
+    """
+
+    def test_element_children_are_exact(self):
+        q = query(self.html, t"<div><p>hi</p></div>")
+        self.assertEqual(1, len(q.matches("<div><p>hi</p></div>")))
+        self.assertEqual([], q.matches("<div><p>hi</p><p>yo</p></div>"))
+        self.assertEqual([], q.matches("<div><p>hi</p><span>z</span></div>"))
+        self.assertEqual([], q.matches("<div><p>bye</p></div>"))
+
+    def test_html_comments_are_tolerated(self):
+        q = query(self.html, t"<div><p>hi</p></div>")
+        self.assertEqual(1, len(q.matches("<div><!-- c --><p>hi</p></div>")))
+
+    def test_ellipsis_admits_extra_elements(self):
+        q = query(self.html, t"<div><p>hi</p>{...}</div>")
+        self.assertEqual(1, len(q.matches("<div><p>hi</p></div>")))
+        self.assertEqual(1, len(q.matches("<div><p>hi</p><p>yo</p></div>")))
+
+    def test_capture_element_text(self):
+        q = query(self.html, t"<p>{capture('body')}</p>")
+        self.assertEqual(["hi"], [m.text("body") for m in q.matches("<div><p>hi</p></div>")])
+
+
+class TestAnythingKind(TemplateQueryTestBase):
+    """``anything(kind)`` must actually constrain the node type."""
+
+    def test_kind_is_enforced(self):
+        q = query(self.python, t"f({anything('integer')})")
+        self.assertEqual(1, len(q.matches("f(1)")))
+        self.assertEqual([], q.matches("f(x)"))
+        self.assertEqual([], q.matches('f("s")'))
+
+    def test_kindless_wildcard_accepts_any_type(self):
+        q = query(self.python, t"f({anything()})")
+        for source in ("f(1)", "f(x)", 'f("s")'):
+            with self.subTest(source=source):
+                self.assertEqual(1, len(q.matches(source)))
+
+    def test_wildcard_does_not_capture(self):
+        q = query(self.python, t"f({anything('integer')})")
+        self.assertEqual([], q.capture_names)
+        (match,) = q.matches("f(1)")
+        self.assertEqual({}, match.captures)
+
+
+if __name__ == "__main__":
+    unittest.main()

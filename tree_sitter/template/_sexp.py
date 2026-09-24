@@ -135,12 +135,16 @@ class NamedNode(Sexp):
                 # at the ends: with end-only anchors a middle wildcard floats,
                 # so `f(a, b)` would match a one-argument pattern.
                 #
-                # Each child is preceded by an optional run of extras so that a
-                # comment in the matched source does not defeat the anchoring.
-                # The sequence then ends with a bare `.`, which is what still
-                # rejects additional *meaningful* children. Note the asymmetry:
-                # a trailing extras run before that final anchor would re-open
-                # the sequence and let any number of real children back in.
+                # Each child is preceded by `. extras *.*` -- an anchor, an
+                # optional run of extras, then another anchor -- so a comment in
+                # the matched source does not defeat the anchoring. The second
+                # anchor is essential: an extras run with nothing after it lets
+                # any sibling slide through it, which made a `<div><p>hi</p>`
+                # template match `<div><p>hi</p><p>yo</p>`.
+                #
+                # The sequence still ends with a bare `.` and never a trailing
+                # extras run, which is what rejects additional *meaningful*
+                # children.
                 #
                 # A gap listed in ``open_gaps`` is left un-anchored: that is
                 # where an ``AnyChildren`` hole was removed, so any number of
@@ -151,10 +155,12 @@ class NamedNode(Sexp):
                 gap = ind + extras_pattern(self.extras) if self.extras else None
                 interleaved = []
                 for i, part in enumerate(parts):
-                    if i not in self.open_gaps:
+                    open_here = i in self.open_gaps
+                    if not open_here:
                         interleaved.append(anchor)
-                    if gap and i not in self.no_extras_at:
+                    if gap and not open_here and i not in self.no_extras_at:
                         interleaved.append(gap)
+                        interleaved.append(anchor)
                     interleaved.append(part)
                 if len(parts) not in self.open_gaps:
                     interleaved.append(anchor)
