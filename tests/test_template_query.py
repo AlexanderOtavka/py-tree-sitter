@@ -697,3 +697,43 @@ class TestKnownBugs(TemplateQueryTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQuantifiers(TemplateQueryTestBase):
+    """``*``/``+`` captures must span a separated list.
+
+    A bare ``(_)*`` matches only named siblings, so in a comma-separated list it
+    stops at the first ``,`` and the query quietly returns nothing.
+    """
+
+    def test_star_spans_a_comma_separated_argument_list(self):
+        q = query(self.python, t"f({capture('args', quantifier='*')})")
+        self.assertEqual([[]], [self.node_texts(m, "args") for m in q.matches("f()")])
+        self.assertEqual([["a"]], [self.node_texts(m, "args") for m in q.matches("f(a)")])
+        self.assertEqual([["a", "b"]], [self.node_texts(m, "args") for m in q.matches("f(a, b)")])
+        self.assertEqual(
+            [["a", "b", "c"]], [self.node_texts(m, "args") for m in q.matches("f(a, b, c)")]
+        )
+
+    def test_separators_are_matched_but_not_captured(self):
+        q = query(self.python, t"f({capture('args', quantifier='*')})")
+        (match,) = q.matches("f(a, b)")
+        self.assertNotIn(",", self.node_texts(match, "args"))
+
+    def test_plus_requires_at_least_one_element(self):
+        q = query(self.python, t"f({capture('args', quantifier='+')})")
+        self.assertEqual([], q.matches("f()"))
+        self.assertEqual([["a", "b"]], [self.node_texts(m, "args") for m in q.matches("f(a, b)")])
+
+    def test_quantifier_in_a_separatorless_sequence_still_works(self):
+        q = query(self.hcl, t'resource "r" "n" {{\n  {capture("a", quantifier="+")}\n}}')
+        self.assertEqual(1, len(q.matches('resource "r" "n" {\n  x = 1\n}\n')))
+        self.assertEqual(1, len(q.matches('resource "r" "n" {\n  x = 1\n  y = 2\n}\n')))
+
+    def test_optional_quantifier_is_unaffected(self):
+        q = query(self.python, t"f({capture('args', quantifier='?')})")
+        self.assertEqual(1, len(q.matches("f()")))
+        self.assertEqual(1, len(q.matches("f(a)")))
+
+    def node_texts(self, match, name):
+        return [node.text.decode() for node in match.all(name)]

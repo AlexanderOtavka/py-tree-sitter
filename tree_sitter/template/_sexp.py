@@ -109,10 +109,17 @@ class NamedNode(Sexp):
     #: one -- JS rejects one before an argument list's ``(`` -- and a single
     #: illegal position must not cost the whole node its comment tolerance.
     no_extras_at: frozenset[int] = frozenset()
+    #: Extra anonymous literals a quantified node may also match, rendered as an
+    #: alternation: ``[(_) @cap ","]*``. Lets a ``*``/``+`` capture span a
+    #: separated list instead of stopping at the first separator.
+    alternatives: tuple[str, ...] = ()
 
     def render(self, indent: int = 0) -> str:
         pad = "  " * indent
         head = "_" if self.kind is None else self.kind
+        if self.alternatives and self.quantifier and not self.children:
+            branches = " ".join([f"({head}){_caps(self.captures)}", *map(quote, self.alternatives)])
+            return f"[{branches}]{self.quantifier}"
         if not self.children:
             body = f"({head})"
         else:

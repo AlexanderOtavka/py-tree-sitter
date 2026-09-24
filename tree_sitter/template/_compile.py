@@ -142,6 +142,43 @@ def _shape_of(child: Sexp) -> tuple:
     return ("?",)
 
 
+#: Separator literals tried when widening a quantified capture. A template only
+#: ever shows one element, so the separator cannot be read off it -- it has to be
+#: guessed and then confirmed against the grammar.
+_SEPARATOR_CANDIDATES = (",", ";", "|", "&&", "||", "+")
+
+
+_UNSET = object()
+
+
+def _find_kind(node: Node, kind: str) -> Node | None:
+    """The first node of type *kind* at or below *node*."""
+    if node.type == kind:
+        return node
+    for child in node.children:
+        found = _find_kind(child, kind)
+        if found is not None:
+            return found
+    return None
+
+
+def _separator_text(children: list[Node]) -> str | None:
+    """The repeated anonymous separator joining *children*, if visible.
+
+    A separator is an anonymous child sitting strictly between two others; the
+    first and last children are delimiters, not separators. Returns ``None`` when
+    the sequence shows no separator, which is the common case for a template
+    (it lists one element, so there is nothing to separate).
+    """
+    if len(children) < 3:
+        return None
+    inner = children[1:-1]
+    texts = {child.text.decode("utf-8", "replace") for child in inner if not child.is_named}
+    if len(texts) != 1:
+        return None
+    return texts.pop()
+
+
 def _has_untiled_text(node: Node, children: list[Node]) -> bool:
     """True when *children* leave meaningful text of *node* unaccounted for.
 
@@ -284,7 +321,8 @@ class _Compiler:
         self.targets = targets
         self.language = language
         self.extras = extra_kinds(language)
-        self._extras_ok: dict[tuple, bool] = {}
+        self._extras_ok: dict[tuple, Any] = {}
+        self._separators: dict[str, Any] = {}
         self.predicates: list[Predicate] = []
         self.capture_names: list[str] = []
         self.private_names: list[str] = []
@@ -447,6 +485,82 @@ class _Compiler:
         return self.source[node.start_byte : node.end_byte].decode("utf-8")
 
     # -- holes ---------------------------------------------------------------
+    def _span_separators(self, children: list[Sexp], raw: list[Node]) -> None:
+        """Let a ``*``/``+`` quantified child absorb the list's separator.
+
+        ``(_)*`` matches only the named siblings, so in a comma-separated list it
+        stops at the first ``,`` and ``f({capture('a', quantifier='*')})`` quietly
+        returns nothing for ``f(a, b)``. Widening it to ``[(_) @a ","]*`` -- with
+        the capture inside, on the node branch, so the separators are matched but
+        not captured -- makes it span the whole list.
+
+        Only applies where a separator actually exists; sequences without one
+        (Python statement blocks, HCL block bodies) already work.
+        """
+        quantified = [
+            child
+            for child in children
+            if isinstance(child, NamedNode)
+            and child.quantifier in ("*", "+")
+            and not child.children
+        ]
+        if not quantified:
+            return
+
+        separator = _separator_text(raw) or self._guess_separator(raw)
+        if separator is None:
+            return
+        for child in quantified:
+            child.alternatives = (separator,)
+
+    def _guess_separator(self, raw: list[Node]) -> str | None:
+        """Discover the separator this node's kind uses, by experiment.
+
+        A template lists a single element, so its own text never shows the
+        separator, and compiling is not a discriminator either -- tree-sitter
+        accepts any anonymous literal inside an alternation. So try each
+        candidate for real: splice a second copy of the element into the
+        template's text with the candidate between them, reparse, and keep the
+        candidate that both parses cleanly and yields the expected two elements.
+        """
+        if self.language is None or len(raw) < 2:
+            return None
+        parent = raw[0].parent
+        if parent is None:
+            return None
+        cached = self._separators.get(parent.type, _UNSET)
+        if cached is not _UNSET:
+            return cached
+
+        element = next((child for child in raw if child.is_named), None)
+        found = None
+        if element is not None:
+            found = self._probe_separator(parent, element)
+        self._separators[parent.type] = found
+        return found
+
+    def _probe_separator(self, parent: Node, element: Node) -> str | None:
+        from tree_sitter import Parser
+
+        parser = Parser(self.language)
+        # Splice into the *whole* template, not just this node's text: a node's
+        # text taken alone often reparses as something else entirely (Python's
+        # `(a, b)` is a tuple, not an argument list).
+        text = self.source
+        cut = element.end_byte
+        piece = text[element.start_byte : element.end_byte]
+        before = len(_non_extra_children(parent))
+
+        for candidate in _SEPARATOR_CANDIDATES:
+            probe = text[:cut] + candidate.encode() + piece + text[cut:]
+            tree = parser.parse(probe)
+            if tree.root_node.has_error:
+                continue
+            grown = _find_kind(tree.root_node, parent.type)
+            if grown is not None and len(_non_extra_children(grown)) == before + 2:
+                return candidate
+        return None
+
     def _hole_sexp(self, slot: HoleSlot) -> Sexp | None:
         """Build the pattern for one hole, or ``None`` to emit nothing."""
         hole = slot.hole
@@ -502,6 +616,8 @@ class _Compiler:
             compiled = self.compile_node(child)
             if compiled is not None:
                 children.append(compiled)
+
+        self._span_separators(children, raw)
 
         anchored = not holes
         if holes and children and not self._identifiable(children):
