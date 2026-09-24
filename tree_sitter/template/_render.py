@@ -251,7 +251,7 @@ def _assemble(
 
 #: Quote characters that, when they already surround a hole in the template,
 #: make the quote-adding padding candidates wrong.
-_QUOTES = ("\"", "'", "`")
+_QUOTES = ('"', "'", "`")
 
 
 def _allowed_candidates(literals: list[str], index: int) -> list[int]:

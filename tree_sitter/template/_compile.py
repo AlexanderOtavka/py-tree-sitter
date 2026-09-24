@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING, Any
 
 from ._errors import TemplateCompileError
 from ._holes import Alternatives, AnyChildren, Capture, HoleSlot, Wildcard
-from ._sexp import AnonNode, NamedNode, Pattern, Predicate, Sexp, extras_pattern, quote
+from ._sexp import AnonNode, NamedNode, Pattern, Predicate, Sexp, quote
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from tree_sitter import Language, Node, Tree
@@ -146,7 +146,7 @@ def _non_extra_children(node: Node) -> list[Node]:
     return [c for c in node.children if not c.is_extra]
 
 
-def orphaned_separators(children: list[Node], holes: set[int]) -> set[int]:
+def orphaned_separators(parent: Node, children: list[Node], holes: set[int]) -> set[int]:
     """Indices of separator children left dangling by removed ``AnyChildren`` holes.
 
     A hole's subtree is dropped from the pattern, but the punctuation that
@@ -155,12 +155,20 @@ def orphaned_separators(children: list[Node], holes: set[int]) -> set[int]:
     ``f(a, {...})`` would compile to ``(argument_list "(" (_) @a "," ")")``, whose
     trailing comma only matches a call that really has a second argument.
 
-    A *separator* is derived positionally rather than from a per-grammar list of
-    punctuation: an anonymous child that sits strictly *between* two other
-    children. That excludes structural delimiters, which are the first and last
-    children of the sequence (``"("``/``")"`` of an ``argument_list``,
-    ``"{"``/``"}"`` of a JSON ``object``) and must be kept -- and it naturally
-    covers grammars that separate with ``;`` or ``|`` instead of ``,``.
+    A *separator* is derived from the grammar rather than from a per-language list
+    of punctuation, so ``;`` or ``|`` work as well as ``,``. It must be:
+
+    * **anonymous** -- named children are meaningful content, never glue;
+    * **strictly interior** -- the first and last children of a sequence are
+      structural delimiters (``"("``/``")"`` of an ``argument_list``,
+      ``"{"``/``"}"`` of a JSON ``object``) and deleting them would be wrong;
+    * **field-free, between field-free neighbours** -- a separator joins members
+      of a homogeneous list, which grammars leave unnamed. Punctuation that
+      structures a *heterogeneous* rule is either a field itself (the ``"+"`` of
+      Python's ``binary_operator`` is its ``operator`` field) or sits between two
+      fields (the ``":"`` of an ``if_statement`` separates ``condition`` from
+      ``consequence``). Both must survive: dropping the colon leaves a pattern
+      the grammar can never match.
 
     Each hole orphans at most *one* separator, so a hole in the middle
     (``f(a, {...}, b)``) still leaves the single comma that joins its surviving
@@ -168,14 +176,22 @@ def orphaned_separators(children: list[Node], holes: set[int]) -> set[int]:
     following one as the fallback -- which is what makes a hole at the start of a
     sequence give up the separator after it instead. A hole that is a sequence's
     only real child (``f({...})``) sits between two delimiters and so orphans
-    nothing.
+    nothing, and a separator-less grammar (an HCL ``body``) never loses anything.
     """
     if not holes:
         return set()
     last = len(children) - 1
+    fields = {id(c): parent.field_name_for_child(i) for i, c in enumerate(parent.children)}
+
+    def field_free(index: int) -> bool:
+        return fields.get(id(children[index])) is None
 
     def is_separator(index: int) -> bool:
-        return 0 < index < last and index not in holes and not children[index].is_named
+        if not (0 < index < last) or index in holes:
+            return False
+        if children[index].is_named or not field_free(index):
+            return False
+        return field_free(index - 1) and field_free(index + 1)
 
     dropped: set[int] = set()
     for hole in sorted(holes):
@@ -272,13 +288,75 @@ class _Compiler:
         shape = ("extras", node.kind, tuple(_shape_of(c) for c in node.children), node.anchored)
         cached = self._extras_ok.get(shape)
         if cached is None:
-            node.extras = self.extras
-            cached = self._compiles(node)
+            cached = self._fit_extras(node)
             self._extras_ok[shape] = cached
-        if cached:
-            node.extras = self.extras
-        else:
-            node.extras = ()
+        node.extras, node.no_extras_at = cached
+
+    def _fit_extras(self, node: NamedNode) -> tuple[tuple[str, ...], frozenset[int]]:
+        """Work out the largest extras set and gap positions *node* accepts.
+
+        Both dimensions have to be narrowed independently, because a single
+        rejection used to cost the node its comment tolerance entirely:
+
+        * kinds -- Rust names three comment kinds but ``(block (doc_comment)*)``
+          is impossible, and one bad member poisons the whole alternation.
+        * positions -- JS accepts a comment between an argument list's arguments
+          but not before its ``(``.
+        """
+        kinds = tuple(k for k in self.extras if self._accepts_kind(node.kind, k))
+        if not kinds:
+            return (), frozenset()
+
+        # An extras run immediately before a trailing *anonymous* delimiter can
+        # absorb real siblings on its way to it, which would let `def f(a)` match
+        # `def f(a, b)`. Named trailing children do not have that problem -- a
+        # comment before HCL's `block_end` sits exactly there and must be
+        # tolerated -- so the exclusion is keyed on the delimiter being anonymous.
+        base: set[int] = set()
+        if node.children and isinstance(node.children[-1], AnonNode):
+            base.add(len(node.children) - 1)
+        # Nor may a run sit before an untyped `(_)` wildcard: the wildcard would
+        # happily bind to a comment, so the run slides along and an extra real
+        # child slips in behind it (`def f(a)` matching `def f(a, b)`).
+        for i, child in enumerate(node.children):
+            if isinstance(child, NamedNode) and child.kind is None and not child.children:
+                base.add(i)
+
+        frozen_base = frozenset(base)
+        node.extras = kinds
+        node.no_extras_at = frozen_base
+        if self._compiles(node):
+            return kinds, frozen_base
+
+        # Narrow to the positions that do compile. Probing each gap on its own
+        # tells us which single positions are legal; the union of those is then
+        # verified once, since legality can interact.
+        blocked = set(base) | {
+            i
+            for i in range(len(node.children))
+            if i not in base and not self._accepts_gap_at(node, kinds, i)
+        }
+        node.no_extras_at = frozenset(blocked)
+        if self._compiles(node):
+            return kinds, frozenset(blocked)
+
+        return (), frozenset()
+
+    def _accepts_kind(self, parent: str | None, kind: str) -> bool:
+        from tree_sitter import Query
+
+        if parent is None:
+            return True
+        try:
+            Query(self.language, f"({parent} ({kind})*)")
+        except Exception:
+            return False
+        return True
+
+    def _accepts_gap_at(self, node: NamedNode, kinds: tuple[str, ...], index: int) -> bool:
+        node.extras = kinds
+        node.no_extras_at = frozenset(i for i in range(len(node.children)) if i != index)
+        return self._compiles(node)
 
     def allow_skip_siblings(self, node: NamedNode) -> None:
         """Let an un-anchored *node* skip unlisted earlier siblings.
@@ -298,6 +376,30 @@ class _Compiler:
             cached = self._compiles(node)
             self._extras_ok[shape] = cached
         node.skip_siblings = cached
+
+    def _identifiable(self, children: list[Sexp]) -> bool:
+        """True when every child can be recognised without relying on position.
+
+        Removing a separator costs the sequence the exactness that separator was
+        accidentally providing, so the anchors have to stay -- but anchors also
+        pin *where* each child sits. That is right for a child the pattern can
+        only find by position and wrong for one it can find by identity.
+
+        Identity here means a *type*: an anonymous literal or a named kind can be
+        looked for wherever it sits. JSON's surviving ``(pair ...)`` is such a
+        child, which is why fully un-anchoring the object is safe and is what lets
+        ``"version"`` be found as the first, last, *or* a middle member.
+
+        A bare ``(_)`` wildcard has no type to search by, so only its position
+        distinguishes it. In ``f({capture('a')}, {...})`` the ``(_) @a`` would bind
+        to *any* argument and ``requests.get(url, timeout=5)`` would yield a
+        spurious second match with ``@a = "timeout=5"``. There the anchors must
+        stay, with only the vacated gap open, holding ``@a`` to the first argument.
+        """
+        return not any(
+            isinstance(child, NamedNode) and child.kind is None and not child.children
+            for child in children
+        )
 
     def _compiles(self, node: NamedNode) -> bool:
         from tree_sitter import Query
@@ -366,19 +468,36 @@ class _Compiler:
         # An AnyChildren hole is emitted as nothing, so the separator that joined
         # it to its neighbours has to go with it -- otherwise the "extra children
         # allowed here" hole silently demands them. See orphaned_separators.
-        skip = holes | orphaned_separators(raw, holes)
-        anchored = not holes
+        skip = holes | orphaned_separators(node, raw, holes)
 
         children: list[Sexp] = []
+        open_gaps: set[int] = set()
         for i, child in enumerate(raw):
             if i in skip:
+                # Record the gap the removed run vacated, so the sequence can
+                # stay anchored everywhere *except* there.
+                open_gaps.add(len(children))
                 continue
             compiled = self.compile_node(child)
             if compiled is not None:
                 children.append(compiled)
 
+        anchored = not holes
+        if holes and children and not self._identifiable(children):
+            # A surviving child that the query can only find by position needs
+            # its anchors, so keep them and open just the gaps the holes vacated.
+            # That holds `@a` to the first argument in `f({capture('a')}, {...})`
+            # instead of letting it float onto any argument.
+            #
+            # Only worth doing when a gap really opened: a separator-less sequence
+            # such as an HCL `body` records none, and keeping its anchors would
+            # make `...` mean nothing at all.
+            anchored = bool(open_gaps)
+
         sexp = NamedNode(kind=node.type, children=children, anchored=anchored)
         if anchored:
+            if holes:
+                sexp.open_gaps = frozenset(open_gaps)
             # Only anchored sequences reject comments, so only they need extras.
             self.allow_extras(sexp)
         else:

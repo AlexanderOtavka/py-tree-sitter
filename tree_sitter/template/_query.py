@@ -166,10 +166,20 @@ class TemplateQuery:
         return [Match(index, self._public(captures)) for index, captures in cursor.matches(root)]
 
     def captures(self, source: str | bytes | Tree) -> dict[str, list[Node]]:
-        """Run the query and return all captures merged by name."""
+        """Run the query and return all captures merged by name.
+
+        Nodes are returned in source order. The underlying
+        :meth:`QueryCursor.captures` does not guarantee an order -- repeating the
+        same call can yield differently ordered lists -- so they are sorted here
+        to keep results reproducible.
+        """
         root = self._parse(source)
         cursor = QueryCursor(self._query)
-        return self._public(cursor.captures(root))
+        captures = self._public(cursor.captures(root))
+        return {
+            name: sorted(nodes, key=lambda node: node.byte_range)
+            for name, nodes in captures.items()
+        }
 
     def first(self, source: str | bytes | Tree) -> Match | None:
         """Return the first match, or ``None`` if the query does not match."""

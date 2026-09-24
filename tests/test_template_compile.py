@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 import tree_sitter_hcl
+import tree_sitter_json
 import tree_sitter_python
 
 from tree_sitter import Language, Parser, Query, QueryCursor
@@ -16,8 +17,10 @@ from tree_sitter.template._holes import (
     Capture,
     HoleSlot,
     Wildcard,
+    capture,
 )
-from tree_sitter.template._sexp import render
+from tree_sitter.template._render import render as render_template
+from tree_sitter.template._sexp import AnonNode, render
 
 
 def slot(index, hole, text, sentinel="TSQH0", pad=""):
@@ -496,3 +499,175 @@ class TestRenderConsistency(TemplateCompileTestBase):
         )
         with self.assertRaises(TemplateCompileError):
             compile_tree(tree, [whole], source=source, language=self.hcl)
+
+
+class TestOrphanedSeparators(TemplateCompileTestBase):
+    """An ``AnyChildren`` hole must take its separator with it.
+
+    The hole itself compiles to nothing, but the punctuation that joined it to its
+    neighbours is a sibling in its own right. Left behind, it turns the hole's
+    "extra children are allowed here" into a demand that they exist.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.json = Language(tree_sitter_json.language())
+
+    def compiled(self, language, template):
+        result = render_template(template, language)
+        source = result.text.encode("utf-8")
+        tree = Parser(language).parse(source)
+        self.assertFalse(tree.root_node.has_error, f"fixture does not parse:\n{result.text}")
+        return compile_tree(tree, result.slots, source=source, language=language)
+
+    def sequence(self, sexp, kind):
+        """Find the first node of type *kind* in a compiled pattern."""
+        if getattr(sexp, "kind", None) == kind:
+            return sexp
+        for child in getattr(sexp, "children", ()):
+            found = self.sequence(child, kind)
+            if found is not None:
+                return found
+        return None
+
+    def literals(self, sexp, kind):
+        """The anonymous literal texts among a sequence's children."""
+        node = self.sequence(sexp, kind)
+        self.assertIsNotNone(node, f"no {kind} in pattern")
+        return [c.text for c in node.children if isinstance(c, AnonNode)]
+
+    def run_template(self, language, template, source):
+        result = self.compiled(language, template)
+        query = Query(language, result.text)
+        tree = Parser(language).parse(source.encode("utf-8"))
+        return result, QueryCursor(query).matches(tree.root_node)
+
+    def texts(self, matches, name):
+        return [n.text.decode("utf-8") for _, caps in matches for n in caps.get(name, [])]
+
+    # -- positional cases ----------------------------------------------------
+
+    def test_hole_at_end_drops_the_preceding_separator(self):
+        """``f(a, {...})`` must also match the one-argument call."""
+        template = t"f({capture('a')}, {...})"
+        result, matches = self.run_template(self.python, template, "f(1)")
+        self.assertNotIn('","', result.text)
+        self.assertEqual(["1"], self.texts(matches, "a"))
+
+        # ...and still admits the extra argument it was written to allow.
+        _, matches = self.run_template(self.python, template, "f(1, 2)")
+        self.assertEqual(["1"], self.texts(matches, "a"))
+
+    def test_hole_at_start_drops_the_following_separator(self):
+        """A leading hole has no separator before it, so the one after it goes."""
+        template = t"f({...}, {capture('b')})"
+        result, matches = self.run_template(self.python, template, "f(1)")
+        self.assertNotIn('","', result.text)
+        self.assertEqual(["1"], self.texts(matches, "b"))
+
+        # The capture is written last, so it binds the *last* argument.
+        _, matches = self.run_template(self.python, template, "f(1, 2)")
+        self.assertEqual(["2"], self.texts(matches, "b"))
+
+    def test_hole_in_the_middle_keeps_exactly_one_separator(self):
+        """``f(a, {...}, b)`` has two commas; only one becomes redundant."""
+        template = t"f({capture('a')}, {...}, {capture('b')})"
+        result = self.compiled(self.python, template)
+        self.assertEqual(["(", ",", ")"], self.literals(result.pattern.root, "argument_list"))
+
+        _, matches = self.run_template(self.python, template, "f(1, 2)")
+        self.assertEqual(
+            [("1", "2")], list(zip(self.texts(matches, "a"), self.texts(matches, "b")))
+        )
+
+    def test_hole_as_only_child_drops_nothing(self):
+        """``f({...})`` has no separators at all -- just the two delimiters."""
+        template = t"f({...})"
+        result = self.compiled(self.python, template)
+        self.assertEqual(["(", ")"], self.literals(result.pattern.root, "argument_list"))
+
+        # Any arity matches, including zero arguments.
+        for source in ("f()", "f(1)", "f(1, 2, 3)"):
+            _, matches = self.run_template(self.python, template, source)
+            self.assertEqual(1, len(matches), source)
+
+    def test_multiple_holes_each_drop_their_own_separator(self):
+        """Two holes around a pinned middle argument leave no commas behind."""
+        template = t"f({...}, {capture('mid')}, {...})"
+        result = self.compiled(self.python, template)
+        self.assertEqual(["(", ")"], self.literals(result.pattern.root, "argument_list"))
+
+        for source, expected in (("f(1)", ["1"]), ("f(1, 2)", ["1", "2"])):
+            _, matches = self.run_template(self.python, template, source)
+            self.assertEqual(expected, self.texts(matches, "mid"), source)
+
+    # -- things that must NOT be dropped -------------------------------------
+
+    def test_structural_delimiters_are_never_dropped(self):
+        """``(`` and ``)`` are anonymous but they are delimiters, not separators."""
+        result = self.compiled(self.python, t"f({capture('a')}, {...})")
+        self.assertEqual(["(", ")"], self.literals(result.pattern.root, "argument_list"))
+
+    def test_field_punctuation_between_fields_is_kept(self):
+        """An ``if_statement``'s ``":"`` separates two *fields*, so it survives.
+
+        It is anonymous and interior, which is all a purely positional rule would
+        check -- but dropping it yields a pattern the grammar cannot match, and
+        frees the condition capture to bind a body statement instead.
+        """
+        template = t"if {capture('cond')}:\n    {...}"
+        result = self.compiled(self.python, template)
+        self.assertIn(":", self.literals(result.pattern.root, "if_statement"))
+
+        source = "if x:\n    return 1\n"
+        _, matches = self.run_template(self.python, template, source)
+        self.assertEqual(["x"], self.texts(matches, "cond"))
+
+    def test_separatorless_grammar_is_unaffected(self):
+        """An HCL ``body`` separates attributes with newlines, not punctuation."""
+        template = t'resource "aws_s3_bucket" {capture("name")} {{\n  acl = "private"\n  {...}\n}}'
+        result = self.compiled(self.hcl, template)
+        body = self.sequence(result.pattern.root, "body")
+        self.assertIsNotNone(body)
+        self.assertEqual([], [c for c in body.children if isinstance(c, AnonNode)])
+
+        # The ellipsis still does its job: an extra attribute is admitted...
+        _, matches = self.run_template(
+            self.hcl,
+            template,
+            'resource "aws_s3_bucket" mybucket {\n  acl = "private"\n  versioning = true\n}\n',
+        )
+        self.assertEqual(["mybucket"], self.texts(matches, "name"))
+        # ...while the listed attribute is still required.
+        _, matches = self.run_template(
+            self.hcl, template, 'resource "aws_s3_bucket" b {\n  other = 1\n}\n'
+        )
+        self.assertEqual([], matches)
+
+    # -- exactness -----------------------------------------------------------
+
+    def test_json_pinned_key_matches_at_any_member_position(self):
+        """The separator removal is what lets the pinned key sit anywhere."""
+        template = t'{{"version": {capture("v")}, {...}}}'
+        for source in (
+            '{"version": "2.1.0", "name": "widget"}',
+            '{"name": "widget", "version": "2.1.0"}',
+            '{"a": 1, "version": "2.1.0", "b": 2}',
+        ):
+            _, matches = self.run_template(self.json, template, source)
+            self.assertEqual(['"2.1.0"'], self.texts(matches, "v"), source)
+
+    def test_ellipsis_does_not_admit_an_object_without_the_key(self):
+        """Relaxing the member count must not relax the member itself."""
+        template = t'{{"version": {capture("v")}, {...}}}'
+        _, matches = self.run_template(self.json, template, '{"name": "widget"}')
+        self.assertEqual([], matches)
+
+    def test_ellipsis_does_not_relax_the_enclosing_call(self):
+        """Only the sequence holding the hole loses exactness."""
+        template = t"f({capture('a')}, {...})"
+        # A different function name still fails, and so does a nested call.
+        for source in ("g(1, 2)", "h(f)"):
+            _, matches = self.run_template(self.python, template, source)
+            self.assertEqual([], matches, source)

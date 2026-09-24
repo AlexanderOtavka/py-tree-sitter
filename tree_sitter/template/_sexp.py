@@ -98,6 +98,17 @@ class NamedNode(Sexp):
     #: earlier siblings can be skipped. Not every node accepts it, so the
     #: compiler probes the grammar before turning it on.
     skip_siblings: bool = False
+    #: Gap positions that must *not* get an anchor in an otherwise anchored
+    #: sequence. Gap ``i`` is the slot before child ``i``; gap ``len(children)``
+    #: is the slot after the last child. Opening exactly the gap an
+    #: ``AnyChildren`` hole vacated relaxes the sibling count *there* while the
+    #: remaining anchors keep every written child pinned to its position.
+    open_gaps: frozenset[int] = frozenset()
+    #: Gap positions that must not get an *extras* run even though the sequence
+    #: is anchored. Some positions reject a comment where their siblings accept
+    #: one -- JS rejects one before an argument list's ``(`` -- and a single
+    #: illegal position must not cost the whole node its comment tolerance.
+    no_extras_at: frozenset[int] = frozenset()
 
     def render(self, indent: int = 0) -> str:
         pad = "  " * indent
@@ -123,17 +134,23 @@ class NamedNode(Sexp):
                 # rejects additional *meaningful* children. Note the asymmetry:
                 # a trailing extras run before that final anchor would re-open
                 # the sequence and let any number of real children back in.
+                #
+                # A gap listed in ``open_gaps`` is left un-anchored: that is
+                # where an ``AnyChildren`` hole was removed, so any number of
+                # siblings may appear there while every other position stays
+                # pinned.
                 ind = "  " * (indent + 1)
                 anchor = ind + "."
                 gap = ind + extras_pattern(self.extras) if self.extras else None
-                interleaved = [anchor]
+                interleaved = []
                 for i, part in enumerate(parts):
-                    if gap:
+                    if i not in self.open_gaps:
+                        interleaved.append(anchor)
+                    if gap and i not in self.no_extras_at:
                         interleaved.append(gap)
                     interleaved.append(part)
-                    if i < len(parts) - 1:
-                        interleaved.append(anchor)
-                interleaved.append(anchor)
+                if len(parts) not in self.open_gaps:
+                    interleaved.append(anchor)
                 inner = "\n".join(interleaved)
             elif self.skip_siblings:
                 # An un-anchored sequence needs an explicit leading `(_)*`.

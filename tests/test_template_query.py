@@ -196,19 +196,14 @@ class TestCoreBehaviour(TemplateQueryTestBase):
         # ...and it is the one-argument call inside broken(), not fetch().
         self.assertEqual(10, matches[0]["a"].start_point.row)
 
-    @unittest.expectedFailure
     def test_ellipsis_admits_the_extra_argument(self):
-        # BUG: dropping the orphaned separator for a trailing `{...}` also drops
-        # the inter-child anchors around the surviving hole, so `@a` now *floats*
-        # inside the argument list and binds to any argument rather than to the
-        # first one. The generated pattern is
-        #     (argument_list "(" (_) @a ")")
-        # with no anchors, so requests.get(url, timeout=5) yields two matches --
-        # one with @a = "url" and a spurious one with @a = "timeout=5".
-        #
-        # `{...}` should relax only the *count* of siblings, not the position of
-        # the explicitly written holes: @a should stay pinned to the first
-        # argument, giving exactly one match per call site.
+        # `{...}` relaxes only the *count* of siblings, not the position of the
+        # holes the user wrote. Dropping the orphaned "," would leave `(_) @a`
+        # free to float onto any argument, so the anchors are kept and only the
+        # gap the hole vacated is opened:
+        #     (argument_list . "(" . (_) @a ")" .)
+        # @a therefore stays pinned to the first argument -- exactly one match per
+        # call site -- while the trailing gap admits the extra `timeout=5`.
         q = query(self.python, t"requests.get({capture('a')}, {...})")
         matches = q.matches(PYTHON_SOURCE)
         # One match per call site, each capturing the first argument.
@@ -334,14 +329,14 @@ class TestHoles(TemplateQueryTestBase):
         q = query(self.python, t"def {capture('fname')}({anything('identifier')}):\n    {...}")
         self.assertEqual(["fetch", "broken"], self.texts(q.matches(PYTHON_SOURCE), "fname"))
 
-    @unittest.expectedFailure
     def test_ellipsis_at_multiple_positions_including_nested(self):
-        # BUG: same float regression as test_ellipsis_admits_the_extra_argument,
-        # seen through a nested `{...}`. The `if` body is relaxed by `{...}`, which
-        # un-anchors @cond as well, so @cond binds not only to the condition `x`
-        # but also to the body statement `return 1`, producing a spurious second
-        # match ('a', 'return 1'). Only ('a', 'x') is correct: @cond is written in
-        # the condition position and should stay there.
+        # A nested `{...}` relaxes the `if` body without disturbing @cond. The
+        # trailing hole in the body sits after the `":"` that separates the
+        # if_statement's `condition` from its `consequence`, but that colon is
+        # structural punctuation between two *field* children, not a list
+        # separator, so it survives and keeps @cond pinned to the condition.
+        # Dropping it would both free @cond to bind `return 1` and leave a
+        # pattern the grammar can never match.
         q = query(
             self.python,
             t"def {capture('fn')}({...}):\n    if {capture('cond')}:\n        {...}\n    {...}",
@@ -677,18 +672,12 @@ class TestKnownBugs(TemplateQueryTestBase):
             [(m.text("type"), m.text("name")) for m in matches],
         )
 
-    @unittest.expectedFailure
     def test_captures_ordering_should_be_deterministic(self):
-        # BUG: TemplateQuery.captures() returns nodes in an unstable order when
-        # given a pre-parsed Tree. Repeating the same call on live trees yields
-        # both ('logs', 'backups', 'public_assets') and
-        # ('logs', 'public_assets', 'backups') across iterations, whereas
-        # .matches() is consistently in source order.
-        #
-        # The instability comes from QueryCursor.captures() itself, and it is
-        # observable through the public API, so a caller cannot rely on capture
-        # order. matches() should be preferred, or captures() should sort by
-        # start_byte.
+        # QueryCursor.captures() does not guarantee an order: repeating the same
+        # call on live pre-parsed trees used to yield both
+        # ('logs', 'backups', 'public_assets') and
+        # ('logs', 'public_assets', 'backups'). TemplateQuery.captures() sorts by
+        # byte range so callers get source order every time.
         q = query(
             self.hcl,
             t"""
