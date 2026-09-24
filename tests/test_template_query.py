@@ -12,6 +12,7 @@ import tree_sitter_hcl
 import tree_sitter_javascript
 import tree_sitter_json
 import tree_sitter_python
+import tree_sitter_rust
 
 from tree_sitter import Language, Node, Parser
 from tree_sitter.template import (
@@ -79,6 +80,7 @@ class TemplateQueryTestBase(TestCase):
         cls.python = Language(tree_sitter_python.language())
         cls.json = Language(tree_sitter_json.language())
         cls.javascript = Language(tree_sitter_javascript.language())
+        cls.rust = Language(tree_sitter_rust.language())
 
     def texts(self, matches, name):
         """Capture texts for ``name``, one entry per match."""
@@ -737,3 +739,83 @@ class TestQuantifiers(TemplateQueryTestBase):
 
     def node_texts(self, match, name):
         return [node.text.decode() for node in match.all(name)]
+
+
+class TestVariadicContainers(TemplateQueryTestBase):
+    """A lone ``{...}`` must relax the container it sits in, not that container's parent.
+
+    A padded hole resolves to the outermost node in its span, so a ``{...}`` alone
+    in a Python function body *is* the whole ``block``. Emitting nothing for it
+    would un-anchor ``function_definition`` instead, quietly relaxing structure
+    the template never mentioned.
+    """
+
+    def test_python_body_ellipsis_does_not_relax_the_signature(self):
+        q = query(self.python, t"def foo():\n    {...}")
+        self.assertEqual(1, len(q.matches("def foo(): pass")))
+        self.assertEqual(1, len(q.matches("def foo():\n    a = 1\n    b = 2\n")))
+        # None of these are `def foo():` -- the signature must stay pinned.
+        self.assertEqual([], q.matches("async def foo(): pass"))
+        self.assertEqual([], q.matches("def foo() -> int: pass"))
+        self.assertEqual([], q.matches("def bar(): pass"))
+        self.assertEqual([], q.matches("def foo(x): pass"))
+
+    def test_python_body_ellipsis_still_tolerates_comments(self):
+        q = query(self.python, t"def foo():\n    {...}")
+        self.assertEqual(1, len(q.matches("def foo():  # why\n    pass")))
+
+    def test_hcl_body_ellipsis_does_not_relax_the_labels(self):
+        q = query(self.hcl, t'resource "a" "b" {{\n  {...}\n}}')
+        self.assertEqual(1, len(q.matches('resource "a" "b" {\n  z = 1\n}\n')))
+        # A third label is structure the template did not ask for.
+        self.assertEqual([], q.matches('resource "a" "b" "c" {\n  z = 1\n}\n'))
+
+    def test_ellipsis_beside_a_real_sibling_still_means_more_siblings(self):
+        """The container rule must not swallow the ordinary relaxing case."""
+        q = query(self.hcl, t'resource "a" "b" {{\n  k = 1\n  {...}\n}}')
+        self.assertEqual(1, len(q.matches('resource "a" "b" {\n  k = 1\n}\n')))
+        self.assertEqual(1, len(q.matches('resource "a" "b" {\n  k = 1\n  z = 2\n}\n')))
+        self.assertEqual([], q.matches('resource "a" "b" {\n  z = 2\n}\n'))
+
+
+class TestCommentTolerance(TemplateQueryTestBase):
+    """A comment in the matched source must never cost a match.
+
+    Anchors reject unlisted children, and comments are children, so without
+    explicit tolerance a template silently stops matching code someone commented.
+    Tolerance must not cost exactness, though.
+    """
+
+    def test_javascript_comments_between_arguments(self):
+        q = query(self.javascript, t"f(a, b)")
+        self.assertEqual(1, len(q.matches("f(a, b)")))
+        self.assertEqual(1, len(q.matches("f(a, /*x*/ b)")))
+        self.assertEqual(1, len(q.matches("f(/*c*/ a, b)")))
+        # Still exact: an extra argument is not a comment.
+        self.assertEqual([], q.matches("f(a, b, c)"))
+        self.assertEqual([], q.matches("f(a)"))
+
+    def test_rust_line_and_block_comments(self):
+        q = query(self.rust, t"fn f() {{ let x = 1; }}")
+        self.assertEqual(1, len(q.matches("fn f() { let x = 1; }")))
+        self.assertEqual(1, len(q.matches("fn f() { // c\n let x = 1; }")))
+        self.assertEqual(1, len(q.matches("fn f() { /*b*/ let x = 1; }")))
+        self.assertEqual([], q.matches("fn f() { let x = 1; let y = 2; }"))
+
+    def test_hcl_comments_in_every_position(self):
+        q = query(self.hcl, t'resource "aws_s3_bucket" "{capture("n")}" {{\n  acl = "private"\n}}')
+        for source in (
+            'resource "aws_s3_bucket" "a" {\n  acl = "private"\n}\n',
+            'resource "aws_s3_bucket" "a" {  # trailing\n  acl = "private"\n}\n',
+            'resource "aws_s3_bucket" "a" {\n  # leading\n  acl = "private"\n}\n',
+            'resource "aws_s3_bucket" "a" {\n  acl = "private"\n  # after\n}\n',
+            '# above\nresource "aws_s3_bucket" "a" {\n  acl = "private"\n}\n',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(["a"], [m.text("n") for m in q.matches(source)])
+
+    def test_comment_tolerance_does_not_admit_real_children(self):
+        q = query(self.hcl, t'resource "aws_s3_bucket" "{capture("n")}" {{\n  acl = "private"\n}}')
+        self.assertEqual(
+            [], q.matches('resource "aws_s3_bucket" "a" {\n  acl = "private"\n  z = 1\n}\n')
+        )

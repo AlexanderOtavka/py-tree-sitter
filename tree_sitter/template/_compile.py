@@ -179,6 +179,70 @@ def _separator_text(children: list[Node]) -> str | None:
     return texts.pop()
 
 
+def _holds_repeats(language: Any, source: bytes, node: Node, child: Node) -> bool:
+    """True when *node* can hold more than one *child*-kind, i.e. it is a list.
+
+    Told apart by experiment rather than by a hardcoded list of kinds: duplicate
+    the child's own text in the template and reparse. A list container (Python's
+    ``block``, HCL's ``body``) absorbs both copies as siblings; a wrapper node
+    (Python's ``expression_statement``) cannot, so the node either gains no child
+    or disappears.
+    """
+    if language is None:
+        return False
+    from tree_sitter import Parser
+
+    piece = source[child.start_byte : child.end_byte]
+    indent = source.rfind(b"\n", 0, child.start_byte) + 1
+    lead = source[indent : child.start_byte]
+    probe = source[: child.end_byte] + b"\n" + lead + piece + source[child.end_byte :]
+    tree = Parser(language).parse(probe)
+    if tree.root_node.has_error:
+        return False
+    # Locate the node by position, not by kind: a grammar may use the same kind at
+    # the file root (HCL's top-level `body` wraps the block's own `body`).
+    grown = tree.root_node.descendant_for_byte_range(child.start_byte, child.end_byte)
+    while grown is not None and grown.type != node.type:
+        grown = grown.parent
+    return grown is not None and len(_non_extra_children(grown)) == 2
+
+
+def _is_variadic_container(
+    node: Node, targets: dict, language: Any = None, source: bytes = b""
+) -> bool:
+    """True when *node* is a container a lone ``{...}`` asked to leave open.
+
+    A padded hole resolves to the outermost node inside its span. When the hole
+    is the *only* thing in its parent, that node is the whole container -- a
+    ``{...}`` alone in a Python function body selects the ``block``, and in an
+    HCL block body the ``body``. Such a node should stay in the pattern with no
+    child constraints: dropping it would un-anchor its *parent* instead, letting
+    ``def foo(): {...}`` match ``async def foo()`` and ``def foo() -> int``.
+
+    When the hole sits alongside real children (``f(a, {...})``) the selected node
+    is just the sentinel's own node, and the ordinary "extra siblings here"
+    handling applies.
+    """
+    slot = targets.get(node.id)
+    if slot is None or not isinstance(slot.hole, AnyChildren):
+        return False
+    children = _non_extra_children(node)
+    if len(children) != 1:
+        # No children: the sentinel stayed a leaf and stands in for one sibling.
+        # Several: the renderer's padding grew it into a construct (HCL's
+        # `TSQH0 = 0` is an `attribute`), which still means "more siblings here".
+        return False
+    # Exactly one child. This is a container the template left open only when the
+    # node is a *list* container -- one that may itself hold a variable number of
+    # children, like Python's `block` or HCL's `body`. A wrapper that merely
+    # re-labels the sentinel (Python's `expression_statement` around a bare
+    # `TSQH2`) is not: there the hole still stands in for one sibling.
+    #
+    # The two are told apart by whether the node accepts a repeated child: a list
+    # container does, a wrapper does not.
+    return _holds_repeats(language, source, node, children[0])
+
+
 def _has_untiled_text(node: Node, children: list[Node]) -> bool:
     """True when *children* leave meaningful text of *node* unaccounted for.
 
@@ -372,8 +436,35 @@ class _Compiler:
         # comment before HCL's `block_end` sits exactly there and must be
         # tolerated -- so the exclusion is keyed on the delimiter being anonymous.
         base: set[int] = set()
-        if node.children and isinstance(node.children[-1], AnonNode):
-            base.add(len(node.children) - 1)
+        # An extras run before an *anonymous* child can absorb whole constructs on
+        # its way to that token: a run before Python's `":"` swallows the `-> int`
+        # of a return annotation, so `def foo():` would match `def foo() -> int:`.
+        # Position 0 is exempt -- a leading run only ever precedes the node, and it
+        # is what keeps `async def` rejected.
+        # Kinds that appear *adjacently* form an unpunctuated run whose length the
+        # grammar does not fix -- HCL block labels are consecutive `string_lit`s.
+        # A gap anywhere in such a run can absorb a real member of it, letting a
+        # two-label template match a three-label block. Repeats that are separated
+        # (JS arguments, divided by `,`) are not affected, because the separator
+        # still has to match.
+        run_kinds: set[str | None] = set()
+        for previous, child in zip(node.children, node.children[1:]):
+            if (
+                isinstance(child, NamedNode)
+                and isinstance(previous, NamedNode)
+                and child.kind == previous.kind
+            ):
+                run_kinds.add(child.kind)
+
+        # Positions inside such a run, and the one just past its end, are unsafe:
+        # HCL's third block label is absorbed by the gap before `block_start`.
+        in_run = False
+        for i, child in enumerate(node.children):
+            kind = child.kind if isinstance(child, NamedNode) else None
+            unsafe = kind in run_kinds and kind is not None
+            if i and (isinstance(child, AnonNode) or unsafe or in_run):
+                base.add(i)
+            in_run = unsafe
         # Nor may a run sit before an untyped `(_)` wildcard: the wildcard would
         # happily bind to a comment, so the run slides along and an extra real
         # child slips in behind it (`def f(a)` matching `def f(a, b)`).
@@ -587,6 +678,14 @@ class _Compiler:
 
     # -- tree walk -----------------------------------------------------------
     def compile_node(self, node: Node) -> Sexp | None:
+        if _is_variadic_container(node, self.targets, self.language, self.source):
+            # A lone `{...}` grew into a whole container: keep the container in
+            # the pattern with no child constraints, instead of emitting nothing
+            # and relaxing its *parent*. Dropping Python's `block` would
+            # un-anchor `function_definition`, letting `def foo(): {...}` match
+            # `async def foo()` and `def foo() -> int`.
+            return NamedNode(kind=node.type, children=[])
+
         slot = self.targets.get(node.id)
         if slot is not None:
             return self._hole_sexp(slot)
@@ -599,6 +698,9 @@ class _Compiler:
             i
             for i, child in enumerate(raw)
             if isinstance(getattr(self.targets.get(child.id), "hole", None), AnyChildren)
+            # A hole that grew into a whole container is kept as that container
+            # (see _is_variadic_container), so it is a real child here, not a gap.
+            and not _is_variadic_container(child, self.targets, self.language, self.source)
         }
         # An AnyChildren hole is emitted as nothing, so the separator that joined
         # it to its neighbours has to go with it -- otherwise the "extra children

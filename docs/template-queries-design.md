@@ -103,6 +103,51 @@ Four rules, each validated against real grammars:
 Comments in the template are skipped (`node.is_extra`) so a commented template
 doesn't demand comments in the matched source.
 
+### Comments in the *matched* source
+
+Anchors reject unlisted children, and a comment is a child, so a template would
+otherwise stop matching code merely because someone commented it. Each anchored
+position therefore also admits a run of the grammar's comment kinds.
+
+Two dimensions have to be narrowed, or the tolerance either fails to compile or
+silently costs exactness. Both are decided by asking the grammar, not from a
+per-language table:
+
+- **kinds** — Rust names three comment kinds, but `(block (doc_comment)*)` is an
+  impossible pattern, and one bad member poisons the whole alternation.
+- **positions** — JS accepts a comment between an argument list's arguments but
+  not before its `(`.
+
+Three positions are always excluded, because a run there can slide past real
+children rather than just comments:
+
+| excluded position | otherwise |
+|---|---|
+| before a trailing anonymous delimiter | `def f(a)` matches `def f(a, b)` |
+| before an untyped `(_)` wildcard | the wildcard binds the comment and slides |
+| inside an adjacent same-kind run, or just past it | a 2-label HCL block matches a 3-label one |
+
+### Anchor placement
+
+Anchors go *between* every pair of children, not just at the ends: with end-only
+anchors a middle wildcard floats, so `f(a)` would match `f(a, b)`.
+
+An un-anchored sequence needs an explicit leading `(_)*`, or tree-sitter lines
+the listed children up against the node's *first* children only — a `...` body
+would then find an attribute solely in first position.
+
+### What `...` attaches to
+
+A padded hole resolves to the outermost node in its span, which is sometimes a
+whole container: `{...}` alone in a Python body *is* the `block`. Emitting
+nothing for it would un-anchor the container's **parent**, relaxing structure the
+template never mentioned (`def foo(): {...}` would match `async def foo()` and
+`def foo() -> int`). So such a node is kept in the pattern, unconstrained.
+
+A container is told from a mere wrapper (Python's `expression_statement` around a
+bare sentinel) by experiment: duplicate the child's text in the template and
+reparse. A list container absorbs both copies as siblings; a wrapper cannot.
+
 ## Step 4 — running (`_query.py`)
 
 Render the pattern, build a real `Query`, and run it through `QueryCursor`.
