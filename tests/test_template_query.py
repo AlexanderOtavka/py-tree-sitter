@@ -819,3 +819,35 @@ class TestCommentTolerance(TemplateQueryTestBase):
         self.assertEqual(
             [], q.matches('resource "aws_s3_bucket" "a" {\n  acl = "private"\n  z = 1\n}\n')
         )
+
+
+class TestEllipsisKeepsSiblingsInPlace(TemplateQueryTestBase):
+    """``...`` relaxes sibling *count* at its own position, not sibling order.
+
+    Un-anchoring the whole sequence would let every other child float, so a
+    template pinning the first argument would match it in any position -- and
+    match twice when two arguments qualify.
+    """
+
+    def test_literal_first_argument_stays_first(self):
+        q = query(self.python, t"f(a, {...})")
+        self.assertEqual(1, len(q.matches("f(a)")))
+        self.assertEqual(1, len(q.matches("f(a, b)")))
+        self.assertEqual(1, len(q.matches("f(a, b, c)")))
+        # `a` is not the first argument in either of these.
+        self.assertEqual([], q.matches("f(b, a)"))
+        self.assertEqual([], q.matches("f(b, c, a)"))
+
+    def test_no_duplicate_match_when_two_arguments_qualify(self):
+        q = query(self.python, t"f(a, {...})")
+        self.assertEqual(1, len(q.matches("f(a, a)")))
+
+    def test_captured_first_argument_stays_first(self):
+        q = query(self.python, t"f({capture('x')}, {...})")
+        self.assertEqual(["a"], [m.text("x") for m in q.matches("f(a, b)")])
+        self.assertEqual(["b"], [m.text("x") for m in q.matches("f(b, a)")])
+
+    def test_ellipsis_still_admits_extra_siblings(self):
+        q = query(self.hcl, t'resource "a" "b" {{\n  k = 1\n  {...}\n}}')
+        self.assertEqual(1, len(q.matches('resource "a" "b" {\n  k = 1\n}\n')))
+        self.assertEqual(1, len(q.matches('resource "a" "b" {\n  k = 1\n  z = 2\n}\n')))

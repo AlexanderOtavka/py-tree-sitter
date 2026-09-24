@@ -98,6 +98,23 @@ def render_pattern(pattern: Pattern) -> str:
 #: something other than plain ``comment``.
 _EXTRA_KIND_HINTS = ("comment",)
 
+#: Characters spliced into the template to ask the grammar whether a node kind can
+#: hold literal text its children do not cover. Several are tried because a probe
+#: has to be legal *where it lands*: a letter is rejected inside a numeric
+#: literal, a digit at the start of an identifier.
+_TEXT_PROBES = (b"z", b"0", b" z")
+
+
+def _node_at(root: Node, kind: str, start: int) -> Node | None:
+    """Find the node of type *kind* beginning at byte *start*, if any."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.start_byte == start and node.type == kind:
+            return node
+        stack.extend(node.children)
+    return None
+
 
 def extra_kinds(language: Any) -> tuple[str, ...]:
     """Return the node kinds that may appear anywhere in a child sequence.
@@ -243,19 +260,25 @@ def _is_variadic_container(
     return _holds_repeats(language, source, node, children[0])
 
 
-def _has_untiled_text(node: Node, children: list[Node]) -> bool:
-    """True when *children* leave meaningful text of *node* unaccounted for.
+def _has_untiled_text(node: Node) -> bool:
+    """True when *node*'s children leave meaningful text of its own unaccounted for.
 
     Any byte of the node not claimed by a child is literal text the pattern would
-    otherwise leave unconstrained. Whitespace between children does not count:
-    it is layout, and the matched source is free to lay itself out differently,
-    so pinning it would reject equivalent code.
+    otherwise leave unconstrained. Two kinds of byte do *not* count:
+
+    * **whitespace** -- it is layout, and the matched source is free to lay itself
+      out differently, so pinning it would reject equivalent code;
+    * **extra children** (comments). They are dropped from the pattern by design,
+      but they are not *untiled* text -- the template's own comment is text the
+      matched source must not be made to reproduce. Tiling therefore accounts for
+      every child, ``is_extra`` included, while the caller decides which children
+      to emit.
     """
     text = node.text
     base = node.start_byte
     gaps: list[bytes] = []
     cursor = base
-    for child in children:
+    for child in node.children:
         if child.start_byte > cursor:
             gaps.append(text[cursor - base : child.start_byte - base])
         cursor = max(cursor, child.end_byte)
@@ -387,6 +410,9 @@ class _Compiler:
         self.extras = extra_kinds(language)
         self._extras_ok: dict[tuple, Any] = {}
         self._separators: dict[str, Any] = {}
+        #: Per node *kind*: may it hold literal text no child covers? Keyed by kind
+        #: because the answer is a property of the grammar rule, not of one node.
+        self._loose_text: dict[str, bool] = {}
         self.predicates: list[Predicate] = []
         self.capture_names: list[str] = []
         self.private_names: list[str] = []
@@ -545,11 +571,15 @@ class _Compiler:
         to *any* argument and ``requests.get(url, timeout=5)`` would yield a
         spurious second match with ``@a = "timeout=5"``. There the anchors must
         stay, with only the vacated gap open, holding ``@a`` to the first argument.
+
+        A childless *named* leaf is no better off. Its kind is shared by every
+        sibling of the same sort -- an ``(identifier)`` among arguments -- so the
+        kind cannot say *which* one is meant. An ``#eq?`` does not help: it
+        constrains the text, not the position, so it matches wherever that text
+        appears. Only a child with structure of its own (JSON's ``(pair ...)``,
+        with its pinned key inside) is genuinely findable by identity.
         """
-        return not any(
-            isinstance(child, NamedNode) and child.kind is None and not child.children
-            for child in children
-        )
+        return not any(isinstance(child, NamedNode) and not child.children for child in children)
 
     def _compiles(self, node: NamedNode) -> bool:
         from tree_sitter import Query
@@ -737,27 +767,73 @@ class _Compiler:
         if anchored:
             if holes:
                 sexp.open_gaps = frozenset(open_gaps)
-            # Only anchored sequences reject comments, so only they need extras.
-            self.allow_extras(sexp)
+            # Only anchored sequences reject comments, so only they need extras --
+            # and only sequences with no open gap can afford them. An extras run
+            # combined with an open gap lets a child slide onto any position, so
+            # `f(a, {...})` would match `f(b, a)`. Exactness wins over tolerating
+            # a comment in the one position a `...` already relaxes.
+            if not sexp.open_gaps:
+                self.allow_extras(sexp)
         else:
             self.allow_skip_siblings(sexp)
 
-        children_of = _non_extra_children(node)
-        if not children_of:
+        if not raw:
             # Rule 3: a named leaf's type does not constrain its text.
             self._pin_text(sexp, node)
-        elif not self._covers_a_hole(node) and _has_untiled_text(node, children_of):
-            # The children do not account for all of this node's text, so the
-            # uncovered literal part is constrained by nothing: Python parses
-            # `"a\nb"`'s content as a `string_content` holding one
-            # `escape_sequence`, leaving the `a` and `b` unpinned, and the
-            # pattern would match `"Xa\nbY"`. That text is not a node, so
-            # anchors cannot help -- pin the whole node's text instead.
+        elif not self._covers_a_hole(node) and self._holds_loose_text(node):
+            # This node can carry literal text that no child accounts for, so
+            # that text is constrained by nothing. Python parses `"a\nb"`'s
+            # content as a `string_content` holding one `escape_sequence`,
+            # leaving `a` and `b` unpinned, so the pattern matches `"Xa\nbY"`;
+            # and `"\n"`'s content is *fully* tiled by its escape, yet the same
+            # pattern still matches `"a\nb"` because nothing forbids the extra
+            # text. Loose text is not a node, so anchors cannot help -- pin the
+            # whole node's text instead.
             #
             # Only safe when nothing below is a hole: pinning the full text of a
             # subtree containing a capture would contradict the capture.
             self._pin_text(sexp, node)
         return sexp
+
+    def _holds_loose_text(self, node: Node) -> bool:
+        """True when *node* may hold literal text that none of its children cover.
+
+        Untiled text in the template proves it directly. A node that happens to be
+        fully tiled needs the question asked of the *grammar* instead, because the
+        matched source may still put text where the template had none: `"\\n"` is
+        exactly covered by its `escape_sequence`, yet `string_content` admits
+        `a\\nb`. Splicing a probe character in at a child boundary and re-parsing
+        answers it without a per-language table -- if the same node then reports
+        untiled text, the type allows it and the pattern has to pin it.
+        """
+        if _has_untiled_text(node):
+            return True
+        return self._probe_loose_text(node.type, node.start_byte, node.children[-1].start_byte)
+
+    def _probe_loose_text(self, kind: str, start: int, boundary: int) -> bool:
+        cached = self._loose_text.get(kind)
+        if cached is not None:
+            return cached
+        result = False
+        for probe in _TEXT_PROBES:
+            spliced = self.source[:boundary] + probe + self.source[boundary:]
+            root = self._reparse(spliced)
+            if root is None:
+                continue
+            same = _node_at(root, kind, start)
+            if same is not None and _has_untiled_text(same):
+                result = True
+                break
+        self._loose_text[kind] = result
+        return result
+
+    def _reparse(self, source: bytes) -> Node | None:
+        from tree_sitter import Parser
+
+        if self.language is None:
+            return None
+        root = Parser(self.language).parse(source).root_node
+        return None if root.has_error else root
 
     def _covers_a_hole(self, node: Node) -> bool:
         """True when any hole's span falls inside *node*.

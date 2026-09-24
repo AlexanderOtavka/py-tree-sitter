@@ -1,8 +1,10 @@
 from unittest import TestCase
 
 import tree_sitter_hcl
+import tree_sitter_javascript
 import tree_sitter_json
 import tree_sitter_python
+import tree_sitter_rust
 
 from tree_sitter import Language, Parser, Query, QueryCursor
 from tree_sitter.template._compile import (
@@ -716,3 +718,116 @@ class TestUntiledLeafText(TemplateCompileTestBase):
         template = t'resource "r" "n" {{\n  acl = "private"\n}}\n'
         spaced = 'resource "r" "n" {\n  acl    =    "private"\n}\n'
         self.assertEqual(1, len(self.matches(self.hcl, template, spaced)))
+
+    def test_fully_tiled_node_still_rejects_surrounding_text(self):
+        """The mirror case: tiled children do not imply the text is constrained.
+
+        ``"\\n"``'s ``string_content`` is covered *exactly* by its
+        ``escape_sequence``, so there is no untiled text in the template to notice.
+        The grammar still lets a ``string_content`` hold ``a\\nb``, so without a
+        pin the pattern matches a string that merely *contains* the escape.
+        """
+        template = t'f("\\n")'
+        self.assertEqual(1, len(self.matches(self.python, template, r'f("\n")')))
+        self.assertEqual([], self.matches(self.python, template, r'f("a\nb")'))
+        self.assertEqual([], self.matches(self.python, template, r'f("\n\n")'))
+
+    def test_pinning_survives_a_second_escape(self):
+        template = t'f("a\\tb\\nc")'
+        self.assertEqual(1, len(self.matches(self.python, template, r'f("a\tb\nc")')))
+        self.assertEqual([], self.matches(self.python, template, r'f("a\tbXc")'))
+
+    def test_a_pin_and_a_capture_coexist_in_one_pattern(self):
+        """A pinned partially-tiled node must not disturb a sibling's capture.
+
+        The escape-bearing ``string_content`` is pinned while the second argument
+        stays a hole, so the pattern constrains the literal *and* still reports the
+        capture.
+        """
+        result = self.compiled(self.python, t'f("a\\nb", {capture("arg")})')
+        query = Query(self.python, result.text)
+        tree = Parser(self.python).parse(rb'f("a\nb", other)')
+        matches = QueryCursor(query).matches(tree.root_node)
+        self.assertEqual(1, len(matches))
+        self.assertEqual("other", matches[0][1]["arg"][0].text.decode())
+
+        # The pin is still doing its job alongside the capture.
+        self.assertEqual(
+            [], self.matches(self.python, t'f("a\\nb", {capture("arg")})', r'f("Xa\nbY", other)')
+        )
+
+    def test_a_template_comment_is_not_pinned_as_text(self):
+        """A comment is dropped from the pattern, so it is not untiled text.
+
+        Tiling has to account for ``is_extra`` children even though they are never
+        emitted. Counting a comment's bytes as uncovered would pin the comment's
+        own text and demand the matched source reproduce it verbatim.
+        """
+        template = t'resource "aws_s3_bucket" "logs" {{\n  # why\n  acl = "private"\n}}'
+        result = self.compiled(self.hcl, template)
+        self.assertNotIn("why", result.text)
+
+        plain = 'resource "aws_s3_bucket" "logs" {\n  acl = "private"\n}\n'
+        self.assertEqual(1, len(self.matches(self.hcl, template, plain)))
+
+
+class TestExtrasNarrowing(TemplateCompileTestBase):
+    """Comment tolerance must degrade per position and per kind, not wholesale.
+
+    Probing the whole node at once and giving up on any failure loses tolerance
+    everywhere: JS rejects a comment before an argument list's ``(`` while every
+    other position accepts one, and Rust names a ``doc_comment`` kind that
+    ``(block (doc_comment)*)`` rejects even though the other two kinds compile.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.javascript = Language(tree_sitter_javascript.language())
+        cls.rust = Language(tree_sitter_rust.language())
+
+    def compiled(self, language, template):
+        result = render_template(template, language)
+        source = result.text.encode("utf-8")
+        tree = Parser(language).parse(source)
+        self.assertFalse(tree.root_node.has_error, f"fixture does not parse:\n{result.text}")
+        return compile_tree(tree, result.slots, source=source, language=language)
+
+    def matches(self, language, template, source):
+        result = self.compiled(language, template)
+        query = Query(language, result.text)
+        tree = Parser(language).parse(source.encode("utf-8"))
+        return QueryCursor(query).matches(tree.root_node)
+
+    def test_js_tolerates_a_comment_between_arguments(self):
+        """One illegal gap must not cost the node its other gaps."""
+        template = t"f(a, b)"
+        self.assertEqual(1, len(self.matches(self.javascript, template, "f(a, b)")))
+        self.assertEqual(1, len(self.matches(self.javascript, template, "f(a, /*x*/ b)")))
+        self.assertEqual(1, len(self.matches(self.javascript, template, "f(/*c*/ a, b)")))
+
+    def test_js_still_rejects_an_extra_argument(self):
+        """Tolerating comments must not tolerate additional real children."""
+        self.assertEqual([], self.matches(self.javascript, t"f(a, b)", "f(a, b, c)"))
+        self.assertEqual([], self.matches(self.javascript, t"f(a, b)", "f(a, /*x*/ b, c)"))
+
+    def test_rust_tolerates_line_and_block_comments(self):
+        """One illegal *kind* must not poison the whole alternation."""
+        template = t"fn f() {{ let x = 1; }}"
+        self.assertEqual(1, len(self.matches(self.rust, template, "fn f() { let x = 1; }")))
+        self.assertEqual(1, len(self.matches(self.rust, template, "fn f() { // c\n let x = 1; }")))
+        self.assertEqual(1, len(self.matches(self.rust, template, "fn f() { /* c */ let x = 1; }")))
+
+    def test_rust_still_rejects_an_extra_statement(self):
+        template = t"fn f() {{ let x = 1; }}"
+        self.assertEqual([], self.matches(self.rust, template, "fn f() { let x = 1; let y = 2; }"))
+        self.assertEqual(
+            [], self.matches(self.rust, template, "fn f() { // c\n let x = 1; let y = 2; }")
+        )
+
+    def test_rust_drops_only_the_impossible_kind(self):
+        """``doc_comment`` is illegal in a ``block``; the other two survive."""
+        result = self.compiled(self.rust, t"fn f() {{ let x = 1; }}")
+        self.assertIn("(line_comment)", result.text)
+        self.assertIn("(block_comment)", result.text)
+        self.assertNotIn("(doc_comment)", result.text)
