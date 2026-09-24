@@ -370,14 +370,44 @@ resource gcp_thing {
 
 class TestExtras(TemplateCompileTestBase):
     def test_comment_in_template_is_skipped(self):
-        """A commented template must still match uncommented source."""
+        """A commented template must still match uncommented source.
+
+        The comment's *text* must not leak into the pattern. ``(comment)*`` runs
+        do appear, but those come from the extras tolerance below, not from the
+        template's own comment.
+        """
         text = 'resource "aws_s3_bucket" TSQH0 {\n  # why\n  acl = "private"\n}\n'
         result = self.compile(self.hcl, text, [slot(0, Capture("name"), text)])
-        self.assertNotIn("comment", result.text)
         self.assertNotIn("why", result.text)
 
         _, matches = self.run_query(self.hcl, result, HCL_TWO_RESOURCES)
         self.assertEqual(len(matches), 1)
+
+    def test_comment_in_source_does_not_break_match(self):
+        """Adding a comment to the matched source must not lose the match."""
+        text = 'resource "aws_s3_bucket" TSQH0 {\n  acl = "private"\n}\n'
+        result = self.compile(self.hcl, text, [slot(0, Capture("name"), text)])
+
+        commented = (
+            b'resource "aws_s3_bucket" "logs" { # trailing\n'
+            b"  # leading\n"
+            b'  acl = "private"\n'
+            b"  # after\n"
+            b"}\n"
+        )
+        _, matches = self.run_query(self.hcl, result, commented)
+        self.assertEqual(len(matches), 1)
+
+    def test_extras_tolerance_does_not_admit_extra_children(self):
+        """Tolerating comments must not tolerate additional real children."""
+        text = 'resource "aws_s3_bucket" TSQH0 {\n  acl = "private"\n}\n'
+        result = self.compile(self.hcl, text, [slot(0, Capture("name"), text)])
+
+        two_attrs = (
+            b'resource "aws_s3_bucket" "logs" {\n  acl = "private"\n  versioning = true\n}\n'
+        )
+        _, matches = self.run_query(self.hcl, result, two_attrs)
+        self.assertEqual(matches, [])
 
 
 class TestErrors(TemplateCompileTestBase):

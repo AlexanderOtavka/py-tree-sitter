@@ -10,7 +10,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-__all__ = ["AnonNode", "NamedNode", "Pattern", "Predicate", "Sexp", "quote", "render"]
+__all__ = [
+    "AnonNode",
+    "NamedNode",
+    "Pattern",
+    "Predicate",
+    "Sexp",
+    "extras_pattern",
+    "quote",
+    "render",
+]
 
 
 def quote(text: str) -> str:
@@ -71,6 +80,11 @@ class NamedNode(Sexp):
         Capture names attached to this node.
     quantifier : str | None
         One of ``"?"``, ``"*"``, ``"+"``.
+    extras : tuple[str, ...]
+        Node kinds that may appear anywhere in an anchored child sequence
+        without breaking the match — comments, typically. Anchors otherwise
+        reject them, which would make a template stop matching source merely
+        because someone commented it.
     """
 
     kind: str | None
@@ -79,6 +93,11 @@ class NamedNode(Sexp):
     anchored: bool = True
     captures: list[str] = field(default_factory=list)
     quantifier: str | None = None
+    extras: tuple[str, ...] = ()
+    #: Emit a leading ``(_)*`` in an un-anchored sequence so that unlisted
+    #: earlier siblings can be skipped. Not every node accepts it, so the
+    #: compiler probes the grammar before turning it on.
+    skip_siblings: bool = False
 
     def render(self, indent: int = 0) -> str:
         pad = "  " * indent
@@ -97,12 +116,33 @@ class NamedNode(Sexp):
                 # Anchors must appear *between* every pair of children, not just
                 # at the ends: with end-only anchors a middle wildcard floats,
                 # so `f(a, b)` would match a one-argument pattern.
-                anchor = "  " * (indent + 1) + "."
+                #
+                # Each child is preceded by an optional run of extras so that a
+                # comment in the matched source does not defeat the anchoring.
+                # The sequence then ends with a bare `.`, which is what still
+                # rejects additional *meaningful* children. Note the asymmetry:
+                # a trailing extras run before that final anchor would re-open
+                # the sequence and let any number of real children back in.
+                ind = "  " * (indent + 1)
+                anchor = ind + "."
+                gap = ind + extras_pattern(self.extras) if self.extras else None
                 interleaved = [anchor]
-                for part in parts:
+                for i, part in enumerate(parts):
+                    if gap:
+                        interleaved.append(gap)
                     interleaved.append(part)
-                    interleaved.append(anchor)
+                    if i < len(parts) - 1:
+                        interleaved.append(anchor)
+                interleaved.append(anchor)
                 inner = "\n".join(interleaved)
+            elif self.skip_siblings:
+                # An un-anchored sequence needs an explicit leading `(_)*`.
+                # Without it tree-sitter only matches the listed children
+                # against the *first* children of the node, so a `...` body
+                # would find `versioning = true` only when it happens to be the
+                # first attribute. `(_)*` lets unlisted siblings be skipped.
+                ind = "  " * (indent + 1)
+                inner = "\n".join([ind + "(_)*", *parts])
             else:
                 inner = "\n".join(parts)
             body = f"({head}\n{inner}\n{pad})"
@@ -140,6 +180,14 @@ class Pattern(Sexp):
         root_text = self.root.render(indent + 1)
         preds = "\n".join("  " * (indent + 1) + p.render() for p in self.predicates)
         return f"{pad}({root_text}\n{preds}{pad})".lstrip()
+
+
+def extras_pattern(extras: tuple[str, ...]) -> str:
+    """Render a repeated-alternation pattern matching any number of *extras*."""
+    if len(extras) == 1:
+        return f"({extras[0]})*"
+    inner = " ".join(f"({kind})" for kind in extras)
+    return f"[{inner}]*"
 
 
 def _caps(captures: list[str]) -> str:

@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING, Any
 
 from ._errors import TemplateCompileError
 from ._holes import Alternatives, AnyChildren, Capture, HoleSlot, Wildcard
-from ._sexp import AnonNode, NamedNode, Pattern, Predicate, Sexp, quote
+from ._sexp import AnonNode, NamedNode, Pattern, Predicate, Sexp, extras_pattern, quote
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from tree_sitter import Language, Node, Tree
@@ -92,6 +92,54 @@ def render_pattern(pattern: Pattern) -> str:
     lives in :meth:`Pattern.render` itself.
     """
     return pattern.render()
+
+
+#: Node kinds treated as skippable extras even when a grammar names them
+#: something other than plain ``comment``.
+_EXTRA_KIND_HINTS = ("comment",)
+
+
+def extra_kinds(language: Any) -> tuple[str, ...]:
+    """Return the node kinds that may appear anywhere in a child sequence.
+
+    Anchored patterns otherwise reject them, so a template would stop matching
+    source code merely because a comment was added to it. Kinds are discovered
+    from the grammar's node-kind table rather than hardcoded per language, so
+    grammars that split comments into several kinds (Rust's ``line_comment`` and
+    ``block_comment``) are handled too.
+
+    Doc-comment *markers* are deliberately excluded: they are components of a
+    doc comment rather than free-floating extras, and including them would widen
+    patterns for no benefit.
+    """
+    if language is None:
+        return ()
+    try:
+        count = language.node_kind_count
+    except AttributeError:  # pragma: no cover - defensive
+        return ()
+
+    found: list[str] = []
+    for kind_id in range(count):
+        kind = language.node_kind_for_id(kind_id)
+        if not kind or kind in found:
+            continue
+        if not language.node_kind_is_named(kind_id):
+            continue
+        if "marker" in kind:
+            continue
+        if any(hint in kind for hint in _EXTRA_KIND_HINTS):
+            found.append(kind)
+    return tuple(found)
+
+
+def _shape_of(child: Sexp) -> tuple:
+    """A cache key describing a child's shape, ignoring captures and text."""
+    if isinstance(child, NamedNode):
+        return ("n", child.kind, child.quantifier, len(child.children))
+    if isinstance(child, AnonNode):
+        return ("a", child.text)
+    return ("?",)
 
 
 def _non_extra_children(node: Node) -> list[Node]:
@@ -158,10 +206,67 @@ class _Compiler:
         self.source = source
         self.targets = targets
         self.language = language
+        self.extras = extra_kinds(language)
+        self._extras_ok: dict[tuple, bool] = {}
         self.predicates: list[Predicate] = []
         self.capture_names: list[str] = []
         self.private_names: list[str] = []
         self._counter = 0
+
+    def allow_extras(self, node: NamedNode) -> None:
+        """Permit extras inside *node* if the grammar accepts them there.
+
+        Comments cannot appear just anywhere: HCL allows one between a block's
+        children but not between the quotes and contents of a ``string_lit``, and
+        emitting one where the grammar forbids it makes tree-sitter reject the
+        entire pattern as an "Impossible pattern". Whether a given position
+        admits a comment depends on the node's *actual children*, not just its
+        kind, so ask the grammar directly: set the extras, try to compile that
+        one subpattern, and roll back if it is rejected.
+
+        The result is cached per (kind, child-shape) because a template
+        repeats shapes often and each probe costs a query compilation.
+        """
+        if not self.extras or self.language is None:
+            return
+        shape = ("extras", node.kind, tuple(_shape_of(c) for c in node.children), node.anchored)
+        cached = self._extras_ok.get(shape)
+        if cached is None:
+            node.extras = self.extras
+            cached = self._compiles(node)
+            self._extras_ok[shape] = cached
+        if cached:
+            node.extras = self.extras
+        else:
+            node.extras = ()
+
+    def allow_skip_siblings(self, node: NamedNode) -> None:
+        """Let an un-anchored *node* skip unlisted earlier siblings.
+
+        Without a leading ``(_)*`` tree-sitter lines the listed children up
+        against the node's *first* children, so a ``...`` body would only match
+        when the attribute the user wrote happens to come first. As with extras,
+        some nodes reject ``(_)*`` outright ("Impossible pattern"), so probe the
+        grammar and roll back when it does not take.
+        """
+        if self.language is None:
+            return
+        shape = ("skip", node.kind, tuple(_shape_of(c) for c in node.children))
+        cached = self._extras_ok.get(shape)
+        if cached is None:
+            node.skip_siblings = True
+            cached = self._compiles(node)
+            self._extras_ok[shape] = cached
+        node.skip_siblings = cached
+
+    def _compiles(self, node: NamedNode) -> bool:
+        from tree_sitter import Query
+
+        try:
+            Query(self.language, node.render())
+        except Exception:
+            return False
+        return True
 
     # -- names ---------------------------------------------------------------
     def _private_name(self) -> str:
@@ -226,6 +331,11 @@ class _Compiler:
                 children.append(compiled)
 
         sexp = NamedNode(kind=node.type, children=children, anchored=anchored)
+        if anchored:
+            # Only anchored sequences reject comments, so only they need extras.
+            self.allow_extras(sexp)
+        else:
+            self.allow_skip_siblings(sexp)
 
         if not _non_extra_children(node):
             # Rule 3: a named leaf's type does not constrain its text.
