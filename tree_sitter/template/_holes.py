@@ -12,13 +12,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 __all__ = [
-    "Hole",
-    "Capture",
-    "Wildcard",
-    "AnyChildren",
     "Alternatives",
-    "capture",
+    "AnyChildren",
+    "Capture",
+    "Hole",
+    "Wildcard",
     "anything",
+    "capture",
 ]
 
 
@@ -106,7 +106,7 @@ def capture(
     kind: str | None = None,
     *,
     pattern: str | None = None,
-    one_of: "list[str] | tuple[str, ...] | None" = None,
+    one_of: list[str] | tuple[str, ...] | None = None,
     quantifier: str | None = None,
 ) -> Capture:
     """Create a :class:`Capture` hole.

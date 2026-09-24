@@ -28,10 +28,11 @@ class BuildExt(build_ext):
 
 
 setup(
-    packages=["tree_sitter"],
+    packages=["tree_sitter", "tree_sitter.template"],
     include_package_data=False,
     package_data={
         "tree_sitter": ["py.typed", "*.pyi"],
+        "tree_sitter.template": ["*.pyi"],
     },
     cmdclass={
         "build_ext": BuildExt,

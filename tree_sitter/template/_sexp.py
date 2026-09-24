@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-__all__ = ["Sexp", "Pattern", "NamedNode", "AnonNode", "Predicate", "render", "quote"]
+__all__ = ["AnonNode", "NamedNode", "Pattern", "Predicate", "Sexp", "quote", "render"]
 
 
 def quote(text: str) -> str:
@@ -93,10 +93,18 @@ class NamedNode(Sexp):
                 if isinstance(child, NamedNode) and child.field_name:
                     prefix = f"{child.field_name}: "
                 parts.append("  " * (indent + 1) + prefix + rendered)
-            inner = "\n".join(parts)
             if self.anchored:
+                # Anchors must appear *between* every pair of children, not just
+                # at the ends: with end-only anchors a middle wildcard floats,
+                # so `f(a, b)` would match a one-argument pattern.
                 anchor = "  " * (indent + 1) + "."
-                inner = f"{anchor}\n{inner}\n{anchor}"
+                interleaved = [anchor]
+                for part in parts:
+                    interleaved.append(part)
+                    interleaved.append(anchor)
+                inner = "\n".join(interleaved)
+            else:
+                inner = "\n".join(parts)
             body = f"({head}\n{inner}\n{pad})"
         return body + _quant(self.quantifier) + _caps(self.captures)
 
@@ -114,17 +122,24 @@ class Predicate(Sexp):
 
 @dataclass
 class Pattern(Sexp):
-    """A complete top-level pattern: a root node plus trailing predicates."""
+    """A complete top-level pattern: a root node plus its predicates.
+
+    The root and its predicates are wrapped in one extra pair of parentheses.
+    That grouping is required, not cosmetic: ``(block ...)`` followed by a bare
+    ``(#eq? ...)`` is parsed by tree-sitter as *two* patterns, and the predicate
+    then constrains neither of them.
+    """
 
     root: Sexp
     predicates: list[Predicate] = field(default_factory=list)
 
     def render(self, indent: int = 0) -> str:
-        out = self.root.render(indent)
-        if self.predicates:
-            preds = "\n".join("  " * (indent + 1) + p.render() for p in self.predicates)
-            out = f"{out}\n{preds}"
-        return out
+        if not self.predicates:
+            return self.root.render(indent)
+        pad = "  " * indent
+        root_text = self.root.render(indent + 1)
+        preds = "\n".join("  " * (indent + 1) + p.render() for p in self.predicates)
+        return f"{pad}({root_text}\n{preds}{pad})".lstrip()
 
 
 def _caps(captures: list[str]) -> str:
