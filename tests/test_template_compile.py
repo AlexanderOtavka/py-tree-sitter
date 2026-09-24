@@ -671,3 +671,48 @@ class TestOrphanedSeparators(TemplateCompileTestBase):
         for source in ("g(1, 2)", "h(f)"):
             _, matches = self.run_template(self.python, template, source)
             self.assertEqual([], matches, source)
+
+
+class TestUntiledLeafText(TemplateCompileTestBase):
+    """Literal text a node's children do not cover must still be pinned.
+
+    Rule 3 pins the text of *childless* named nodes. A node whose children cover
+    only part of its text -- Python parses a string's content as a
+    ``string_content`` holding an ``escape_sequence`` -- would otherwise leave the
+    surrounding literal text constrained by nothing. That text is not a node, so
+    anchors cannot help either.
+    """
+
+    def compiled(self, language, template):
+        result = render_template(template, language)
+        source = result.text.encode("utf-8")
+        tree = Parser(language).parse(source)
+        self.assertFalse(tree.root_node.has_error, f"fixture does not parse:\n{result.text}")
+        return compile_tree(tree, result.slots, source=source, language=language)
+
+    def matches(self, language, template, source):
+        result = self.compiled(language, template)
+        query = Query(language, result.text)
+        tree = Parser(language).parse(source.encode("utf-8"))
+        return QueryCursor(query).matches(tree.root_node)
+
+    def test_text_around_an_escape_sequence_is_pinned(self):
+        template = t'f("a\\nb")'
+        self.assertEqual(1, len(self.matches(self.python, template, r'f("a\nb")')))
+        self.assertEqual([], self.matches(self.python, template, r'f("Xa\nbY")'))
+        self.assertEqual([], self.matches(self.python, template, r'f("zzz\nzzz")'))
+
+    def test_a_capture_inside_a_partially_tiled_node_still_captures(self):
+        """Pinning must not swallow a node containing a hole."""
+        result = self.compiled(self.python, t'f("{capture("s")}")')
+        query = Query(self.python, result.text)
+        tree = Parser(self.python).parse(b'f("hello")')
+        matches = QueryCursor(query).matches(tree.root_node)
+        self.assertEqual(1, len(matches))
+        self.assertEqual("hello", matches[0][1]["s"][0].text.decode())
+
+    def test_layout_whitespace_is_not_pinned(self):
+        """Gaps that are only whitespace are layout, not meaning."""
+        template = t'resource "r" "n" {{\n  acl = "private"\n}}\n'
+        spaced = 'resource "r" "n" {\n  acl    =    "private"\n}\n'
+        self.assertEqual(1, len(self.matches(self.hcl, template, spaced)))

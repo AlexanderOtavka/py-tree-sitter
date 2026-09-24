@@ -142,6 +142,27 @@ def _shape_of(child: Sexp) -> tuple:
     return ("?",)
 
 
+def _has_untiled_text(node: Node, children: list[Node]) -> bool:
+    """True when *children* leave meaningful text of *node* unaccounted for.
+
+    Any byte of the node not claimed by a child is literal text the pattern would
+    otherwise leave unconstrained. Whitespace between children does not count:
+    it is layout, and the matched source is free to lay itself out differently,
+    so pinning it would reject equivalent code.
+    """
+    text = node.text
+    base = node.start_byte
+    gaps: list[bytes] = []
+    cursor = base
+    for child in children:
+        if child.start_byte > cursor:
+            gaps.append(text[cursor - base : child.start_byte - base])
+        cursor = max(cursor, child.end_byte)
+    if cursor < node.end_byte:
+        gaps.append(text[cursor - base :])
+    return any(gap.strip() for gap in gaps)
+
+
 def _non_extra_children(node: Node) -> list[Node]:
     return [c for c in node.children if not c.is_extra]
 
@@ -503,12 +524,38 @@ class _Compiler:
         else:
             self.allow_skip_siblings(sexp)
 
-        if not _non_extra_children(node):
+        children_of = _non_extra_children(node)
+        if not children_of:
             # Rule 3: a named leaf's type does not constrain its text.
-            name = self._private_name()
-            sexp.captures.append(name)
-            self.predicates.append(Predicate("eq?", [f"@{name}", quote(self._text(node))]))
+            self._pin_text(sexp, node)
+        elif not self._covers_a_hole(node) and _has_untiled_text(node, children_of):
+            # The children do not account for all of this node's text, so the
+            # uncovered literal part is constrained by nothing: Python parses
+            # `"a\nb"`'s content as a `string_content` holding one
+            # `escape_sequence`, leaving the `a` and `b` unpinned, and the
+            # pattern would match `"Xa\nbY"`. That text is not a node, so
+            # anchors cannot help -- pin the whole node's text instead.
+            #
+            # Only safe when nothing below is a hole: pinning the full text of a
+            # subtree containing a capture would contradict the capture.
+            self._pin_text(sexp, node)
         return sexp
+
+    def _covers_a_hole(self, node: Node) -> bool:
+        """True when any hole's span falls inside *node*.
+
+        Used to keep text pinning off subtrees containing a capture: the captured
+        text is by definition not known from the template.
+        """
+        return any(
+            node.start_byte <= slot.start and slot.end <= node.end_byte
+            for slot in self.targets.values()
+        )
+
+    def _pin_text(self, sexp: NamedNode, node: Node) -> None:
+        name = self._private_name()
+        sexp.captures.append(name)
+        self.predicates.append(Predicate("eq?", [f"@{name}", quote(self._text(node))]))
 
 
 def compile_tree(
