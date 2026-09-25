@@ -54,7 +54,7 @@ class TestTrapOneForwardIteration(TestCase):
         nodes = self.names()
         self.assertEqual(["alpha", "beta", "gamma"], [n.text.decode() for n in nodes])
 
-        edits = Edits(self.SOURCE)
+        edits = Edits()
         for node in nodes:
             edits.replace(node, "renamed")
 
@@ -75,14 +75,14 @@ class TestTrapOneForwardIteration(TestCase):
             "def renamed(): pass\nderenamedta(): passrenamedgamma(): pass\n",
             broken,
         )
-        self.assertEqual(correct, Edits(self.SOURCE).replace_all(nodes, "renamed").apply())
+        self.assertEqual(correct, Edits().replace_all(nodes, "renamed").apply())
 
     def test_queue_order_does_not_affect_result(self):
         nodes = self.names()
-        forward = Edits(self.SOURCE).replace_all(nodes, "renamed").apply()
-        backward = Edits(self.SOURCE).replace_all(list(reversed(nodes)), "renamed").apply()
+        forward = Edits().replace_all(nodes, "renamed").apply()
+        backward = Edits().replace_all(list(reversed(nodes)), "renamed").apply()
         shuffled = (
-            Edits(self.SOURCE)
+            Edits()
             .replace(nodes[1], "renamed")
             .replace(nodes[2], "renamed")
             .replace(nodes[0], "renamed")
@@ -95,7 +95,7 @@ class TestTrapOneForwardIteration(TestCase):
         """Growth and shrinkage in the same batch is where drift shows up worst."""
         nodes = self.names()
         result = (
-            Edits(self.SOURCE)
+            Edits()
             .replace(nodes[0], "a_very_much_longer_name")
             .replace(nodes[1], "b")
             .replace(nodes[2], "c")
@@ -125,7 +125,7 @@ class TestTrapTwoByteOffsets(TestCase):
     def test_replacement_after_non_ascii_lands_correctly(self):
         last = self.strings()[-1]
         self.assertEqual(b'"plain"', last.text)
-        result = Edits(self.SOURCE).replace(last, '"REPLACED"')
+        result = Edits().replace(last, '"REPLACED"')
         self.assertEqual(
             'a = "café"\nb = "漢字"\nc = "\U0001f680"\nd = "REPLACED"\n',
             result.apply(),
@@ -147,7 +147,7 @@ class TestTrapTwoByteOffsets(TestCase):
 
     def test_edits_replaces_the_emoji_node_correctly(self):
         emoji = self.strings()[2]
-        result = Edits(self.SOURCE).replace(emoji, '"R"').apply()
+        result = Edits().replace(emoji, '"R"').apply()
         self.assertEqual('a = "café"\nb = "漢字"\nc = "R"\nd = "plain"\n', result)
 
     def test_character_indexing_would_have_been_wrong_for_the_last_node(self):
@@ -162,12 +162,12 @@ class TestTrapTwoByteOffsets(TestCase):
 
     def test_every_non_ascii_string_replaced_at_once(self):
         nodes = self.strings()
-        result = Edits(self.SOURCE).replace_all(nodes, '"x"').apply()
+        result = Edits().replace_all(nodes, '"x"').apply()
         self.assertEqual('a = "x"\nb = "x"\nc = "x"\nd = "x"\n', result)
 
     def test_replacement_text_may_itself_be_non_ascii(self):
         nodes = self.strings()
-        result = Edits(self.SOURCE).replace(nodes[-1], '"naïve \U0001f600"').apply()
+        result = Edits().replace(nodes[-1], '"naïve \U0001f600"').apply()
         self.assertEqual(
             'a = "café"\nb = "漢字"\nc = "\U0001f680"\nd = "naïve \U0001f600"\n',
             result,
@@ -175,7 +175,7 @@ class TestTrapTwoByteOffsets(TestCase):
 
     def test_insert_before_non_ascii_node(self):
         nodes = self.strings()
-        result = Edits(self.SOURCE).insert_before(nodes[0], "/*c*/").apply()
+        result = Edits().insert_before(nodes[0], "/*c*/").apply()
         self.assertEqual(
             'a = /*c*/"café"\nb = "漢字"\nc = "\U0001f680"\nd = "plain"\n',
             result,
@@ -198,7 +198,7 @@ class TestTrapThreeOverlaps(TestCase):
         self.assertEqual((42, 51), outer.byte_range)
         self.assertEqual((42, 43), inner.byte_range)
 
-        edits = Edits(self.TERRAFORM).replace(outer, '"public"').replace(inner, "'")
+        edits = Edits().replace(outer, '"public"').replace(inner, "'")
         with self.assertRaises(OverlappingEditError) as ctx:
             edits.apply()
 
@@ -213,7 +213,7 @@ class TestTrapThreeOverlaps(TestCase):
 
     def test_two_replacements_of_the_same_node_conflict(self):
         node = captured(HCL, self.TERRAFORM, "(string_lit) @s", "s")[0]
-        edits = Edits(self.TERRAFORM).replace(node, '"a"').replace(node, '"b"')
+        edits = Edits().replace(node, '"a"').replace(node, '"b"')
         with self.assertRaises(OverlappingEditError) as ctx:
             edits.apply()
         self.assertIn(f"[{node.start_byte}, {node.end_byte})", str(ctx.exception))
@@ -221,18 +221,18 @@ class TestTrapThreeOverlaps(TestCase):
     def test_deleting_and_replacing_the_same_node_conflicts(self):
         node = captured(HCL, self.TERRAFORM, "(string_lit) @s", "s")[0]
         with self.assertRaises(OverlappingEditError):
-            Edits(self.TERRAFORM).delete(node).replace(node, '"x"').apply()
+            Edits().delete(node).replace(node, '"x"').apply()
 
     def test_partial_overlap_of_unrelated_ranges_conflicts(self):
         """Nesting is the common case, but a straddling overlap must also raise."""
         nodes = captured(JSON, '{"a":1,"b":2}', "(pair) @p", "p")
         outer = captured(JSON, '{"a":1,"b":2}', "(object) @o", "o")[0]
         with self.assertRaises(OverlappingEditError):
-            Edits('{"a":1,"b":2}').replace(outer, "{}").replace(nodes[0], '"z":9').apply()
+            Edits().replace(outer, "{}").replace(nodes[0], '"z":9').apply()
 
     def test_failed_apply_leaves_the_object_usable(self):
         nodes = captured(HCL, self.TERRAFORM, "(string_lit) @s", "s")
-        edits = Edits(self.TERRAFORM).replace(nodes[0], '"a"').replace(nodes[0], '"b"')
+        edits = Edits().replace(nodes[0], '"a"').replace(nodes[0], '"b"')
         with self.assertRaises(OverlappingEditError):
             edits.apply()
         self.assertEqual(2, len(edits))
@@ -243,7 +243,7 @@ class TestTrapThreeOverlaps(TestCase):
         obj = captured(JSON, source, "(object) @o", "o")[0]
         pair = captured(JSON, source, "(pair) @p", "p")[1]
         number = captured(JSON, source, "(number) @n", "n")[1]
-        edits = Edits(source).replace(obj, "{}").insert_before(pair, "X").replace(number, "9")
+        edits = Edits().replace(obj, "{}").insert_before(pair, "X").replace(number, "9")
         with self.assertRaises(OverlappingEditError):
             edits.apply()
 
@@ -264,13 +264,13 @@ class TestAdjacentSpans(TestCase):
     def test_touching_replacements_do_not_raise(self):
         pair = captured(JSON, self.SOURCE, "(pair) @p", "p")[0]
         comma = captured(JSON, self.SOURCE, '"," @c', "c")[0]
-        result = Edits(self.SOURCE).replace(pair, '"z":9').replace(comma, " , ").apply()
+        result = Edits().replace(pair, '"z":9').replace(comma, " , ").apply()
         self.assertEqual('{"z":9 , "b":2}', result)
 
     def test_touching_in_reverse_queue_order_also_fine(self):
         pair = captured(JSON, self.SOURCE, "(pair) @p", "p")[0]
         comma = captured(JSON, self.SOURCE, '"," @c', "c")[0]
-        result = Edits(self.SOURCE).replace(comma, " , ").replace(pair, '"z":9').apply()
+        result = Edits().replace(comma, " , ").replace(pair, '"z":9').apply()
         self.assertEqual('{"z":9 , "b":2}', result)
 
     def test_sibling_tokens_across_a_whole_object(self):
@@ -280,9 +280,7 @@ class TestAdjacentSpans(TestCase):
         value = captured(JSON, self.SOURCE, "(number) @n", "n")[0]
         self.assertEqual(key.end_byte, colon.start_byte)
         self.assertEqual(colon.end_byte, value.start_byte)
-        result = (
-            Edits(self.SOURCE).replace(key, '"K"').replace(colon, ": ").replace(value, "42").apply()
-        )
+        result = Edits().replace(key, '"K"').replace(colon, ": ").replace(value, "42").apply()
         self.assertEqual('{"K": 42,"b":2}', result)
 
 
@@ -294,31 +292,31 @@ class TestInsertAndDelete(TestCase):
         return captured(PYTHON, self.SOURCE, self.SEXP, "n")
 
     def test_insert_before(self):
-        result = Edits(self.SOURCE).insert_before(self.names()[0], "my_").apply()
+        result = Edits().insert_before(self.names()[0], "my_").apply()
         self.assertEqual("def my_alpha(): pass\ndef beta(): pass\n", result)
 
     def test_insert_after(self):
-        result = Edits(self.SOURCE).insert_after(self.names()[0], "_v2").apply()
+        result = Edits().insert_after(self.names()[0], "_v2").apply()
         self.assertEqual("def alpha_v2(): pass\ndef beta(): pass\n", result)
 
     def test_insert_before_and_after_the_same_node(self):
         node = self.names()[1]
-        result = Edits(self.SOURCE).insert_before(node, "<").insert_after(node, ">").apply()
+        result = Edits().insert_before(node, "<").insert_after(node, ">").apply()
         self.assertEqual("def alpha(): pass\ndef <beta>(): pass\n", result)
 
     def test_delete(self):
-        result = Edits(self.SOURCE).delete(self.names()[0]).apply()
+        result = Edits().delete(self.names()[0]).apply()
         self.assertEqual("def (): pass\ndef beta(): pass\n", result)
 
     def test_delete_equals_replace_with_empty_string(self):
         node = self.names()[1]
         self.assertEqual(
-            Edits(self.SOURCE).replace(node, "").apply(),
-            Edits(self.SOURCE).delete(node).apply(),
+            Edits().replace(node, "").apply(),
+            Edits().delete(node).apply(),
         )
 
     def test_delete_several_nodes(self):
-        edits = Edits(self.SOURCE)
+        edits = Edits()
         for node in self.names():
             edits.delete(node)
         self.assertEqual("def (): pass\ndef (): pass\n", edits.apply())
@@ -326,14 +324,14 @@ class TestInsertAndDelete(TestCase):
     def test_insert_at_the_very_start_of_the_source(self):
         root_first = captured(PYTHON, self.SOURCE, "(function_definition) @f", "f")[0]
         self.assertEqual(0, root_first.start_byte)
-        result = Edits(self.SOURCE).insert_before(root_first, "# header\n").apply()
+        result = Edits().insert_before(root_first, "# header\n").apply()
         self.assertEqual("# header\ndef alpha(): pass\ndef beta(): pass\n", result)
 
     def test_insert_after_the_last_node(self):
         """The last ``function_definition`` stops before the trailing newline."""
         last = captured(PYTHON, self.SOURCE, "(function_definition) @f", "f")[-1]
         self.assertEqual(len(self.SOURCE.encode()) - 1, last.end_byte)
-        edits = Edits(self.SOURCE).insert_after(last, "\n# footer")
+        edits = Edits().insert_after(last, "\n# footer")
         self.assertEqual("def alpha(): pass\ndef beta(): pass\n# footer\n", edits.apply())
 
     def test_insert_at_the_absolute_end_offset(self):
@@ -343,16 +341,16 @@ class TestInsertAndDelete(TestCase):
         self.assertEqual(len(self.SOURCE.encode()), root.end_byte)
         self.assertEqual(
             "def alpha(): pass\ndef beta(): pass\n# eof",
-            Edits(self.SOURCE).insert_after(root, "# eof").apply(),
+            Edits().insert_after(root, "# eof").apply(),
         )
 
     def test_replace_the_entire_source(self):
         root = Parser(PYTHON).parse(self.SOURCE.encode()).root_node
-        self.assertEqual("pass\n", Edits(self.SOURCE).replace(root, "pass\n").apply())
+        self.assertEqual("pass\n", Edits().replace(root, "pass\n").apply())
 
     def test_delete_the_first_node_and_insert_at_the_last(self):
         nodes = self.names()
-        result = Edits(self.SOURCE).delete(nodes[0]).insert_after(nodes[1], "_x").apply()
+        result = Edits().delete(nodes[0]).insert_after(nodes[1], "_x").apply()
         self.assertEqual("def (): pass\ndef beta_x(): pass\n", result)
 
 
@@ -373,24 +371,24 @@ class TestInsertionConflictRules(TestCase):
 
     def test_two_insertions_at_the_same_point_are_allowed_in_queue_order(self):
         node = self.names()[0]
-        result = Edits(self.SOURCE).insert_before(node, "A").insert_before(node, "B").apply()
+        result = Edits().insert_before(node, "A").insert_before(node, "B").apply()
         self.assertEqual("def ABalpha(): pass\ndef beta(): pass\n", result)
 
     def test_same_point_insertion_order_is_the_reverse_when_queued_the_other_way(self):
         node = self.names()[0]
-        result = Edits(self.SOURCE).insert_before(node, "B").insert_before(node, "A").apply()
+        result = Edits().insert_before(node, "B").insert_before(node, "A").apply()
         self.assertEqual("def BAalpha(): pass\ndef beta(): pass\n", result)
 
     def test_three_insertions_at_the_same_point_stay_in_queue_order(self):
         node = self.names()[0]
-        edits = Edits(self.SOURCE)
+        edits = Edits()
         for text in ("1", "2", "3"):
             edits.insert_before(node, text)
         self.assertEqual("def 123alpha(): pass\ndef beta(): pass\n", edits.apply())
 
     def test_insert_after_one_node_and_before_the_next_are_independent(self):
         nodes = self.names()
-        result = Edits(self.SOURCE).insert_after(nodes[0], "!").insert_before(nodes[1], "?").apply()
+        result = Edits().insert_after(nodes[0], "!").insert_before(nodes[1], "?").apply()
         self.assertEqual("def alpha!(): pass\ndef ?beta(): pass\n", result)
 
     def test_insertion_strictly_inside_a_replaced_range_raises(self):
@@ -399,43 +397,39 @@ class TestInsertionConflictRules(TestCase):
         inner = self.names()[0]
         self.assertLess(func.start_byte, inner.start_byte)
         self.assertLess(inner.start_byte, func.end_byte)
-        edits = Edits(self.SOURCE).replace(func, "def x(): pass").insert_before(inner, "Z")
+        edits = Edits().replace(func, "def x(): pass").insert_before(inner, "Z")
         with self.assertRaises(OverlappingEditError) as ctx:
             edits.apply()
         self.assertIn("insert at", str(ctx.exception))
 
     def test_insert_before_at_the_start_boundary_of_a_replacement_is_outside_it(self):
         node = self.names()[0]
-        result = Edits(self.SOURCE).replace(node, "renamed").insert_before(node, "# ").apply()
+        result = Edits().replace(node, "renamed").insert_before(node, "# ").apply()
         self.assertEqual("def # renamed(): pass\ndef beta(): pass\n", result)
 
     def test_insert_after_at_the_end_boundary_of_a_replacement_follows_it(self):
         node = self.names()[0]
-        result = Edits(self.SOURCE).replace(node, "renamed").insert_after(node, "_x").apply()
+        result = Edits().replace(node, "renamed").insert_after(node, "_x").apply()
         self.assertEqual("def renamed_x(): pass\ndef beta(): pass\n", result)
 
     def test_boundary_insertions_are_order_independent_relative_to_the_replacement(self):
         node = self.names()[0]
-        a = Edits(self.SOURCE).replace(node, "R").insert_before(node, "<").apply()
-        b = Edits(self.SOURCE).insert_before(node, "<").replace(node, "R").apply()
+        a = Edits().replace(node, "R").insert_before(node, "<").apply()
+        b = Edits().insert_before(node, "<").replace(node, "R").apply()
         self.assertEqual(a, b)
         self.assertEqual("def <R(): pass\ndef beta(): pass\n", a)
 
     def test_wrap_a_replacement_on_both_boundaries(self):
         node = self.names()[1]
         result = (
-            Edits(self.SOURCE)
-            .insert_before(node, "(")
-            .replace(node, "GAMMA")
-            .insert_after(node, ")")
-            .apply()
+            Edits().insert_before(node, "(").replace(node, "GAMMA").insert_after(node, ")").apply()
         )
         self.assertEqual("def alpha(): pass\ndef (GAMMA)(): pass\n", result)
 
     def test_insertion_at_a_deleted_nodes_boundary_survives(self):
         """Deletion is replacement with ""; boundary insertions still anchor."""
         node = self.names()[0]
-        result = Edits(self.SOURCE).delete(node).insert_before(node, "gone").apply()
+        result = Edits().delete(node).insert_before(node, "gone").apply()
         self.assertEqual("def gone(): pass\ndef beta(): pass\n", result)
 
 
@@ -446,15 +440,26 @@ class TestApplySemantics(TestCase):
     def names(self):
         return captured(PYTHON, self.SOURCE, self.SEXP, "n")
 
-    def test_empty_edits_returns_source_unchanged(self):
-        self.assertEqual(self.SOURCE, Edits(self.SOURCE).apply())
+    def tree(self, source=SOURCE):
+        return Parser(PYTHON).parse(source.encode())
 
-    def test_empty_edits_on_bytes_returns_bytes_unchanged(self):
-        raw = self.SOURCE.encode()
-        self.assertEqual(raw, Edits(raw).apply())
+    def test_empty_edits_bound_to_a_tree_returns_source_unchanged(self):
+        self.assertEqual(self.SOURCE, Edits(self.tree()).apply())
+
+    def test_empty_unbound_edits_has_no_source_to_apply(self):
+        edits = Edits()
+        self.assertIsNone(edits.source)
+        with self.assertRaises(ValueError) as ctx:
+            edits.apply()
+        self.assertIn("Edits(tree)", str(ctx.exception))
+
+    def test_source_is_taken_from_the_first_node(self):
+        edits = Edits()
+        edits.replace(self.names()[0], "x")
+        self.assertEqual(self.SOURCE.encode(), edits.source)
 
     def test_apply_is_idempotent_and_object_stays_usable(self):
-        edits = Edits(self.SOURCE).replace(self.names()[0], "renamed")
+        edits = Edits().replace(self.names()[0], "renamed")
         expected = "def renamed(): pass\ndef beta(): pass\n"
         self.assertEqual(expected, edits.apply())
         self.assertEqual(expected, edits.apply())
@@ -464,28 +469,38 @@ class TestApplySemantics(TestCase):
         self.assertEqual("def renamed(): pass\ndef also(): pass\n", edits.apply())
         self.assertEqual(2, len(edits))
 
-    def test_str_in_str_out(self):
-        result = Edits(self.SOURCE).replace(self.names()[0], "x").apply()
+    def test_apply_returns_str(self):
+        result = Edits().replace(self.names()[0], "x").apply()
         self.assertIsInstance(result, str)
 
-    def test_bytes_in_bytes_out(self):
-        result = Edits(self.SOURCE.encode()).replace(self.names()[0], "x").apply()
+    def test_apply_bytes_returns_bytes(self):
+        result = Edits().replace(self.names()[0], "x").apply_bytes()
         self.assertIsInstance(result, bytes)
         self.assertEqual(b"def x(): pass\ndef beta(): pass\n", result)
 
-    def test_bytes_and_str_produce_equivalent_output(self):
-        nodes = self.names()
-        as_str = Edits(self.SOURCE).replace_all(nodes, "z").apply()
-        as_bytes = Edits(self.SOURCE.encode()).replace_all(nodes, "z").apply()
-        self.assertEqual(as_str.encode(), as_bytes)
+    def test_apply_bytes_handles_a_source_that_is_not_valid_utf8(self):
+        source = b"x = '\xff'\ny = 1\n"
+        tree = Parser(PYTHON).parse(source)
+        (node,) = [
+            n
+            for n in QueryCursor(Query(PYTHON, "(assignment left: (identifier) @n)")).captures(
+                tree.root_node
+            )["n"]
+            if n.text == b"y"
+        ]
+        self.assertEqual(b"x = '\xff'\nz = 1\n", Edits().replace(node, "z").apply_bytes())
 
-    def test_bytearray_source_is_accepted_and_returns_bytes(self):
-        result = Edits(bytearray(self.SOURCE.encode())).replace(self.names()[0], "x").apply()
-        self.assertIsInstance(result, bytes)
-        self.assertEqual(b"def x(): pass\ndef beta(): pass\n", result)
+    def test_replacement_text_may_be_bytes(self):
+        result = Edits().replace(self.names()[0], b"x").apply()
+        self.assertEqual("def x(): pass\ndef beta(): pass\n", result)
+
+    def test_tree_parsed_from_a_bytearray_is_accepted(self):
+        tree = Parser(PYTHON).parse(bytearray(self.SOURCE.encode()))
+        node = tree.root_node.children[0].child_by_field_name("name")
+        self.assertEqual("def x(): pass\ndef beta(): pass\n", Edits().replace(node, "x").apply())
 
     def test_len_and_bool(self):
-        edits = Edits(self.SOURCE)
+        edits = Edits(self.tree())
         self.assertEqual(0, len(edits))
         self.assertFalse(edits)
         edits.replace(self.names()[0], "x")
@@ -493,7 +508,7 @@ class TestApplySemantics(TestCase):
         self.assertTrue(edits)
 
     def test_fluent_chaining_returns_the_same_object(self):
-        edits = Edits(self.SOURCE)
+        edits = Edits()
         nodes = self.names()
         chained = (
             edits.replace(nodes[0], "a")
@@ -505,53 +520,63 @@ class TestApplySemantics(TestCase):
         self.assertEqual("def a(): pass\ndef bbetac(): pass\n", chained.apply())
 
     def test_replace_all_with_an_iterator(self):
-        result = Edits(self.SOURCE).replace_all(iter(self.names()), "q").apply()
+        result = Edits().replace_all(iter(self.names()), "q").apply()
         self.assertEqual("def q(): pass\ndef q(): pass\n", result)
 
     def test_replace_all_with_no_nodes_queues_nothing(self):
-        edits = Edits(self.SOURCE).replace_all([], "x")
+        edits = Edits(self.tree()).replace_all([], "x")
         self.assertEqual(0, len(edits))
         self.assertEqual(self.SOURCE, edits.apply())
 
-    def test_nodes_from_a_shorter_source_are_rejected(self):
-        node = captured(PYTHON, self.SOURCE, self.SEXP, "n")[-1]
-        with self.assertRaises(ValueError) as ctx:
-            Edits("def a(): pass\n").replace(node, "x")
-        self.assertIn("different source", str(ctx.exception))
+    def test_nodes_from_different_sources_cannot_share_a_batch(self):
+        """The first node binds the source; a node from another text is refused.
 
-    def test_nodes_from_a_same_length_source_are_rejected(self):
-        """A range check alone cannot catch this -- the offsets are all in bounds.
-
-        Without comparing the node's own text to the source, this silently edits
-        the wrong span, which is the exact failure mode this class exists to stop.
+        Same length on purpose: every offset is in bounds, so nothing short of
+        comparing sources could catch it, and it would edit the wrong span.
         """
-        node = captured(PYTHON, "def foo(): pass\n", self.SEXP, "n")[0]
-        other = "def zzz(): pass\n"  # same length, different text
-        self.assertEqual(len(other), len("def foo(): pass\n"))
-        with self.assertRaises(ValueError) as ctx:
-            Edits(other).replace(node, "x")
-        message = str(ctx.exception)
-        self.assertIn("different source", message)
-        self.assertIn("zzz", message)
-        self.assertIn("foo", message)
-
-    def test_insertions_also_validate_the_node(self):
-        node = captured(PYTHON, "def foo(): pass\n", self.SEXP, "n")[0]
-        for method in ("insert_before", "insert_after", "delete"):
+        foo = captured(PYTHON, "def foo(): pass\n", self.SEXP, "n")[0]
+        zzz = captured(PYTHON, "def zzz(): pass\n", self.SEXP, "n")[0]
+        for method in ("replace", "insert_before", "insert_after", "delete"):
             with self.subTest(method=method):
-                edits = Edits("def zzz(): pass\n")
-                args = () if method == "delete" else ("x",)
-                with self.assertRaises(ValueError):
-                    getattr(edits, method)(node, *args)
+                edits = Edits().replace(foo, "x")
+                args = () if method == "delete" else ("y",)
+                with self.assertRaises(ValueError) as ctx:
+                    getattr(edits, method)(zzz, *args)
+                self.assertIn("different source", str(ctx.exception))
+                self.assertEqual(1, len(edits))
 
-    def test_a_node_from_the_same_source_is_accepted(self):
-        """The guard must not reject legitimate nodes."""
-        node = captured(PYTHON, self.SOURCE, self.SEXP, "n")[0]
-        self.assertEqual(1, len(Edits(self.SOURCE).replace(node, "x")))
-        self.assertEqual(1, len(Edits(self.SOURCE.encode()).replace(node, "x")))
+    def test_node_from_a_different_source_than_the_bound_tree_is_refused(self):
+        node = captured(PYTHON, "def zzz(): pass\n", self.SEXP, "n")[0]
+        with self.assertRaises(ValueError):
+            Edits(self.tree("def foo(): pass\n")).replace(node, "x")
+
+    def test_a_reparse_of_the_same_text_is_accepted(self):
+        """Two trees of identical text agree on every offset, so mixing is safe."""
+        first = captured(PYTHON, self.SOURCE, self.SEXP, "n")[0]
+        second = captured(PYTHON, self.SOURCE, self.SEXP, "n")[1]
+        self.assertIsNot(first.tree, second.tree)
+        result = Edits().replace(first, "a").replace(second, "b").apply()
+        self.assertEqual("def a(): pass\ndef b(): pass\n", result)
+
+    def test_nodes_from_an_edited_tree_are_refused(self):
+        """After ``Tree.edit`` the offsets describe a source nobody has."""
+        tree = self.tree()
+        node = tree.root_node.children[0].child_by_field_name("name")
+        tree.edit(0, 0, 1, (0, 0), (0, 0), (0, 1))
+        with self.assertRaises(ValueError) as ctx:
+            Edits().replace(node, "x")
+        self.assertIn("edited", str(ctx.exception))
+
+    def test_nodes_from_a_read_callable_parse_are_refused(self):
+        raw = self.SOURCE.encode()
+        tree = Parser(PYTHON).parse(lambda offset, _point: raw[offset : offset + 1])
+        node = tree.root_node.children[0].child_by_field_name("name")
+        with self.assertRaises(TypeError) as ctx:
+            Edits().replace(node, "x")
+        self.assertIn("read callable", str(ctx.exception))
 
     def test_repr_mentions_the_queue_size(self):
-        edits = Edits(self.SOURCE).replace(self.names()[0], "x")
+        edits = Edits().replace(self.names()[0], "x")
         self.assertIn("1 queued", repr(edits))
 
 
@@ -565,7 +590,7 @@ class TestEditsDecoupling(TestCase):
         nodes = sorted(cursor.captures(tree.root_node)["n"], key=lambda n: n.byte_range)
         self.assertEqual(["fetch", "save"], [n.text.decode() for n in nodes])
 
-        edits = Edits(source)
+        edits = Edits()
         for node in nodes:
             edits.replace(node, f"do_{node.text.decode()}")
 
@@ -588,7 +613,7 @@ class TestEditsDecoupling(TestCase):
             stack.extend(node.children)
 
         self.assertEqual(2, len(numbers))
-        self.assertEqual('{"a":0,"b":0}', Edits(source).replace_all(numbers, "0").apply())
+        self.assertEqual('{"a":0,"b":0}', Edits().replace_all(numbers, "0").apply())
 
     def test_module_does_not_import_the_template_pipeline(self):
         """The decoupling is a design constraint, so assert it directly."""
@@ -629,12 +654,13 @@ class TestTemplateIntegration(TestCase):
         "}\n"
     )
 
-    def test_template_query_edit_returns_an_edits_for_the_source(self):
+    def test_nodes_from_a_query_on_one_text_cannot_edit_another(self):
+        """The reason ``Edits`` takes no source string: it cannot be mismatched."""
         q = query(HCL, t'resource "aws_s3_bucket" {capture("name")} {{ {...} }}')
-        edits = q.edit(self.TERRAFORM)
-        self.assertIsInstance(edits, Edits)
-        self.assertEqual(0, len(edits))
-        self.assertEqual(self.TERRAFORM, edits.apply())
+        edits = Edits().replace(q.first(self.TERRAFORM)["name"], '"x"')
+        other = self.TERRAFORM.replace('"logs"', '"lags"')
+        with self.assertRaises(ValueError):
+            edits.replace(q.first(other)["name"], '"y"')
 
     def test_rename_every_matching_resource_end_to_end(self):
         """The realistic case: rename all aws_s3_bucket resources, leave others alone."""
@@ -642,7 +668,7 @@ class TestTemplateIntegration(TestCase):
         matches = q.matches(self.TERRAFORM)
         self.assertEqual(2, len(matches))
 
-        edits = q.edit(self.TERRAFORM)
+        edits = Edits()
         for match in matches:
             node = match["name"]
             edits.replace(node, f'"legacy_{node.text.decode().strip(chr(34))}"')
@@ -664,7 +690,7 @@ class TestTemplateIntegration(TestCase):
 
     def test_rename_the_resource_type_itself(self):
         q = query(HCL, t"resource {capture('type')} {capture('name')} {{ {...} }}")
-        edits = Edits(self.TERRAFORM)
+        edits = Edits()
         for match in q.matches(self.TERRAFORM):
             if match.text("type") == '"aws_s3_bucket"':
                 edits.replace(match["type"], '"aws_s3_bucket_v2"')
@@ -683,10 +709,10 @@ class TestTemplateIntegration(TestCase):
         self.assertGreater(len(nodes), 1)
 
         # Indexing silently gives you only the first -- the trap replace_all closes.
-        only_first = Edits(source).replace(match["args"], "0").apply()
+        only_first = Edits().replace(match["args"], "0").apply()
         self.assertEqual(1, only_first.count("0"))
 
-        all_of_them = Edits(source).replace_all(nodes, "0").apply()
+        all_of_them = Edits().replace_all(nodes, "0").apply()
         self.assertEqual(len(nodes), all_of_them.count("0"))
         self.assertNotEqual(only_first, all_of_them)
 

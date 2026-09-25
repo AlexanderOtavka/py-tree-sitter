@@ -15,6 +15,13 @@ PyObject *tree_get_root_node(Tree *self, void *Py_UNUSED(payload)) {
     return node_new_internal(state, node, (PyObject *)self);
 }
 
+PyObject *tree_get_source(Tree *self, void *Py_UNUSED(payload)) {
+    if (self->source == NULL) {
+        Py_RETURN_NONE;
+    }
+    return Py_NewRef(self->source);
+}
+
 PyObject *tree_root_node_with_offset(Tree *self, PyObject *args) {
     uint32_t offset_bytes;
     TSPoint offset_extent;
@@ -243,6 +250,10 @@ static PyGetSetDef tree_accessors[] = {
      PyDoc_STR("The included ranges that were used to parse the syntax tree."), NULL},
     {"language", (getter)tree_get_language, NULL,
      PyDoc_STR("The language that was used to parse the syntax tree."), NULL},
+    {"source", (getter)tree_get_source, NULL,
+     PyDoc_STR("The source the tree was parsed from: a bytes-like object, a read callable, "
+               "or ``None`` once the tree has been edited."),
+     NULL},
     {NULL},
 };
 

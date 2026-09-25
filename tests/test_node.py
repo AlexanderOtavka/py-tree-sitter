@@ -437,6 +437,11 @@ class TestNode(TestCase):
         for item in parser.parse(code).root_node.children:
             self.assertIsNotNone(item.is_named)
 
+    def test_tree(self):
+        tree = Parser(self.python).parse(b"def foo(): pass")
+        self.assertIs(tree.root_node.tree, tree)
+        self.assertIs(tree.root_node.children[0].child_by_field_name("name").tree, tree)
+
     def test_text(self):
         parser = Parser(self.python)
         tree = parser.parse(b"[0, [1, 2, 3]]")

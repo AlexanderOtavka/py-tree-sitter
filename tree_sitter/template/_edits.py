@@ -26,16 +26,15 @@ three traps, every one of which corrupts the output silently rather than raising
   in plain source order, the natural thing to do.
 * :meth:`Edits.apply` applies in **descending start order**, so each splice only
   disturbs text that has already been dealt with. Trap 1 cannot happen.
-* The source is converted to ``bytes`` exactly once, in the constructor, and back
-  exactly once, in :meth:`Edits.apply`. All splicing happens in the byte domain
-  that ``start_byte`` / ``end_byte`` are expressed in. Trap 2 cannot happen.
+* There is no source argument to get wrong: :class:`Edits` reads the source from
+  the tree the first queued node belongs to (:attr:`tree_sitter.Tree.source`),
+  so the bytes being spliced are by construction the bytes the offsets were
+  measured against. All splicing happens in that byte domain. Trap 2 cannot
+  happen.
 * :meth:`Edits.apply` refuses conflicting edits with
   :class:`OverlappingEditError` instead of producing quietly wrong text.
-* Every queued node is checked against the source it is supposed to describe, by
-  comparing the node's own text to the bytes at its offsets. A node parsed from a
-  *different* source is the same class of bug -- a range check alone misses it
-  whenever the other source happens to be long enough -- so it raises rather than
-  splicing at a meaningless position.
+* Every later node must come from a tree parsed from that same source. A node
+  from a different source raises instead of splicing at a meaningless position.
 
 This module deliberately knows nothing about template queries. It takes plain
 :class:`~tree_sitter.Node` objects, so it works with a hand-written
@@ -47,7 +46,7 @@ anything that can hand you a node.
     from tree_sitter import Language, Parser, Query, QueryCursor
     from tree_sitter.template import Edits
 
-    edits = Edits(source)
+    edits = Edits()
     for node in QueryCursor(Query(PY, "(function_definition name: (identifier) @n)")).captures(
         tree.root_node
     )["n"]:
@@ -63,7 +62,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from tree_sitter import Node
+    from tree_sitter import Node, Tree
 
 __all__ = ["Edits", "OverlappingEditError"]
 
@@ -116,38 +115,50 @@ class _Edit:
 class Edits:
     """A batch of source rewrites, queued against node offsets and applied at once.
 
+    The source is never passed as text: it is taken from the tree of the first
+    node you queue, and every later node must belong to a tree parsed from that
+    same source. Nodes from a query run on one text therefore cannot be applied
+    to another.
+
+    Parameters
+    ----------
+    tree : tree_sitter.Tree, optional
+        Bind to this tree's source up front instead of the first node's. Only
+        needed when the batch may end up empty -- say, a query with no matches --
+        and you still want :meth:`apply` to return the unchanged source.
+
     Every mutating method returns ``self``, so calls chain. Nothing is applied
     until :meth:`apply`, which is non-destructive: it builds a fresh result from
     the original source each time, leaving this object usable afterwards.
 
-    Parameters
-    ----------
-    source : str | bytes
-        The exact source the nodes were parsed from. :meth:`apply` returns the
-        same type: ``str`` in, ``str`` out; ``bytes`` in, ``bytes`` out.
-
     Examples
     --------
-    >>> Edits('a = "x"').replace(node, '"y"').apply()
+    >>> Edits().replace(node, '"y"').apply()
     'a = "y"'
     """
 
-    __slots__ = ("_edits", "_source", "_was_str")
+    __slots__ = ("_edits", "_source", "_tree")
 
-    def __init__(self, source: str | bytes) -> None:
-        self._was_str = isinstance(source, str)
-        # Trap 2: the one and only encode. Everything downstream is bytes.
-        self._source = source.encode(_ENCODING) if isinstance(source, str) else bytes(source)
+    def __init__(self, tree: Tree | None = None) -> None:
+        self._tree: Tree | None = None
+        self._source: bytes | None = None
         self._edits: list[_Edit] = []
+        if tree is not None:
+            self._adopt(tree, "tree")
+
+    @property
+    def source(self) -> bytes | None:
+        """The source being edited, or ``None`` until the first edit is queued."""
+        return self._source
 
     # -- queueing ---------------------------------------------------------
 
-    def replace(self, node: Node, text: str) -> Edits:
+    def replace(self, node: Node, text: str | bytes) -> Edits:
         """Queue replacing ``node``'s source text with ``text``."""
-        self._check_node(node)
+        self._bind(node)
         return self._queue(node.start_byte, node.end_byte, text, _REPLACE)
 
-    def replace_all(self, nodes: Iterable[Node], text: str) -> Edits:
+    def replace_all(self, nodes: Iterable[Node], text: str | bytes) -> Edits:
         """Queue the same replacement for several nodes.
 
         A quantified capture matches several nodes, and indexing a match yields
@@ -157,77 +168,74 @@ class Edits:
             self.replace(node, text)
         return self
 
-    def insert_before(self, node: Node, text: str) -> Edits:
+    def insert_before(self, node: Node, text: str | bytes) -> Edits:
         """Queue inserting ``text`` immediately before ``node``.
 
         Zero-width at ``node.start_byte``: it does not replace anything, so it
         never conflicts with an edit to a different node.
         """
-        self._check_node(node)
+        self._bind(node)
         return self._queue(node.start_byte, node.start_byte, text, _INSERT)
 
-    def insert_after(self, node: Node, text: str) -> Edits:
+    def insert_after(self, node: Node, text: str | bytes) -> Edits:
         """Queue inserting ``text`` immediately after ``node``.
 
         Zero-width at ``node.end_byte``.
         """
-        self._check_node(node)
+        self._bind(node)
         return self._queue(node.end_byte, node.end_byte, text, _INSERT)
 
     def delete(self, node: Node) -> Edits:
         """Queue removing ``node``'s source text. Equivalent to replacing it with ``""``."""
         return self.replace(node, "")
 
-    def _check_node(self, node: Node) -> None:
-        """Verify *node* really describes this source.
+    def _bind(self, node: Node) -> None:
+        """Adopt *node*'s source on the first edit; afterwards, insist on it."""
+        if node.tree is not self._tree:
+            self._adopt(node.tree, f"node {node.type!r}")
 
-        The byte-range check in :meth:`_queue` only catches offsets past the end,
-        so a node parsed from a *different* source of similar length would splice
-        at meaningless positions and corrupt silently -- precisely the failure this
-        class exists to prevent. Comparing the node's own text against the source
-        at those offsets closes that hole for one bytes comparison per edit.
-        """
-        start, end = node.start_byte, node.end_byte
-        if 0 <= start <= end <= len(self._source) and self._source[start:end] == node.text:
-            return
-        found = (
-            self._source[start:end] if 0 <= start <= end <= len(self._source) else b"<out of range>"
-        )
-        raise ValueError(
-            f"node {node.type!r} spans [{start}, {end}) where this source has "
-            f"{found!r}, not the node's own text {node.text!r} -- "
-            f"was it parsed from a different source?"
-        )
-
-    def _queue(self, start: int, end: int, text: str, kind: str) -> Edits:
-        if start < 0 or end > len(self._source):
-            # Cheap guard against nodes parsed from a *different* source, which
-            # would otherwise splice at meaningless offsets and corrupt silently
-            # in exactly the same way the traps above do.
+    def _adopt(self, tree: Tree, what: str) -> None:
+        source = tree.source
+        if source is None:
             raise ValueError(
-                f"byte range [{start}, {end}) is outside the source "
-                f"(0 to {len(self._source)}) -- were these nodes parsed from this source?"
+                f"{what} belongs to a tree that has been edited since it was parsed, "
+                "so its offsets no longer describe any known source"
             )
-        self._edits.append(_Edit(start, end, text.encode(_ENCODING), kind, len(self._edits)))
+        if callable(source):
+            raise TypeError(
+                f"{what} belongs to a tree parsed from a read callable; "
+                "Edits needs a tree parsed from bytes"
+            )
+        source = bytes(source)
+        if self._source is None:
+            self._tree, self._source = tree, source
+        elif source != self._source:
+            raise ValueError(
+                f"{what} was parsed from a different source than this batch is "
+                "editing; one Edits batch rewrites one source"
+            )
+        # A re-parse of identical text is fine: its offsets mean the same thing.
+
+    def _queue(self, start: int, end: int, text: str | bytes, kind: str) -> Edits:
+        data = text.encode(_ENCODING) if isinstance(text, str) else bytes(text)
+        self._edits.append(_Edit(start, end, data, kind, len(self._edits)))
         return self
 
     # -- applying ---------------------------------------------------------
 
-    def apply(self) -> str | bytes:
-        """Apply every queued edit and return the rewritten source.
+    def apply(self) -> str:
+        """Apply every queued edit and return the rewritten source as ``str``.
 
         Non-destructive: the queue is untouched, so calling this twice returns the
         same result and the object stays usable.
 
-        Returns
-        -------
-        str | bytes
-            ``str`` if this :class:`Edits` was built from a ``str``, else ``bytes``.
-
         Raises
         ------
         OverlappingEditError
-            If two queued edits conflict. See :meth:`Edits.apply` notes below.
+            If two queued edits conflict.
+        ValueError
+            If nothing has been queued and no ``tree`` was given, so there is no
+            source to rewrite.
 
         Notes
         -----
@@ -245,15 +253,26 @@ class Edits:
           **queue order**: the first one queued appears first in the output. The
           caller controls the sequence simply by the order of the calls.
         """
+        # Trap 2: the one and only decode.
+        return self.apply_bytes().decode(_ENCODING)
+
+    def apply_bytes(self) -> bytes:
+        """Like :meth:`apply`, but return the rewritten source as ``bytes``.
+
+        Use this for a source that is not valid UTF-8 text.
+        """
+        if self._source is None:
+            raise ValueError(
+                "no edits queued, so there is no source to rewrite -- pass the tree "
+                "to Edits(tree) if the batch may be empty"
+            )
         ordered = self._ordered()
         self._check_overlaps(ordered)
         out = bytearray(self._source)
         # Descending, so each splice only moves text that is already final.
         for edit in reversed(ordered):
             out[edit.start : edit.end] = edit.text
-        result = bytes(out)
-        # Trap 2: the one and only decode.
-        return result.decode(_ENCODING) if self._was_str else result
+        return bytes(out)
 
     def _ordered(self) -> list[_Edit]:
         """Return the edits in ascending application order.
@@ -304,5 +323,5 @@ class Edits:
         return bool(self._edits)
 
     def __repr__(self) -> str:
-        kind = "str" if self._was_str else "bytes"
-        return f"<Edits {len(self._edits)} queued, {len(self._source)} {kind} bytes>"
+        size = "unbound" if self._source is None else f"{len(self._source)} bytes"
+        return f"<Edits {len(self._edits)} queued, {size}>"

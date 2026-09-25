@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 from tree_sitter import Language, Node, Parser, Query, QueryCursor, Tree
 
 from ._compile import compile_tree
-from ._edits import Edits
 from ._errors import TemplateCompileError, TemplateError, TemplateSyntaxError
 from ._render import render as render_template
 
@@ -186,14 +185,6 @@ class TemplateQuery:
         """Return the first match, or ``None`` if the query does not match."""
         matches = self.matches(source)
         return matches[0] if matches else None
-
-    def edit(self, source: str | bytes) -> Edits:
-        """Start a batch of rewrites against ``source``.
-
-        Sugar for ``Edits(source)``; :class:`~tree_sitter.template.Edits` is
-        independent of this query and accepts nodes from any source.
-        """
-        return Edits(source)
 
     def __repr__(self) -> str:
         return f"<TemplateQuery captures={self.capture_names}>"

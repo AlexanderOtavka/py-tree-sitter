@@ -13,6 +13,21 @@ class TestTree(TestCase):
         cls.python = Language(tree_sitter_python.language())
         cls.rust = Language(tree_sitter_rust.language())
 
+    def test_source(self):
+        parser = Parser(self.python)
+        source = b"def foo(): pass"
+        tree = parser.parse(source)
+        self.assertIs(tree.source, source)
+        self.assertIs(tree.copy().source, source)
+
+        tree.edit(0, 0, 1, (0, 0), (0, 0), (0, 1))
+        self.assertIsNone(tree.source)
+
+        def read(offset, _point):
+            return source[offset : offset + 1]
+
+        self.assertIs(parser.parse(read).source, read)
+
     def test_edit(self):
         parser = Parser(self.python)
         tree = parser.parse(b"def foo():\n  bar()")

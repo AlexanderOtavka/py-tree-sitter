@@ -357,18 +357,24 @@ and nothing stops you editing a node and something nested inside it.
 ```python
 from tree_sitter.template import Edits
 
-edits = Edits(source)
+edits = Edits()
 for match in q.matches(source):
     edits.replace(match["name"], "prod_" + match.text("name"))
 new_source = edits.apply()
 ```
 
-Queue in any order, including plain source order; `apply()` sorts descending
-internally, does the encode/decode exactly once, and raises
-`OverlappingEditError` rather than producing quietly wrong text. Also available:
-`insert_before`, `insert_after`, `delete`, and `replace_all` for a quantified
-capture's `match.all(name)`. `str` in gives `str` out, `bytes` gives `bytes`, and
-`apply()` is non-destructive so the object stays reusable.
+There is no source argument: `Edits` reads it from the tree the nodes belong to
+(the new `Node.tree` and `Tree.source` properties), so the text being rewritten
+is always the text the query ran on. Queueing a node from a tree parsed from
+different text raises `ValueError`. So does a tree changed with `Tree.edit`.
+
+Queue in any order, including plain source order. `apply()` sorts descending
+internally, splices in bytes, and raises `OverlappingEditError` rather than
+producing quietly wrong text. Also available: `insert_before`, `insert_after`,
+`delete`, and `replace_all` for a quantified capture's `match.all(name)`.
+`apply()` returns `str`, `apply_bytes()` returns `bytes`. Both are
+non-destructive, so the object stays reusable. Pass `Edits(tree)` if the batch
+might end up empty and you still want the unchanged source back.
 
 This module knows nothing about template queries — it takes plain `Node`s, so it
 works just as well with a hand-written S-expression `Query` or a manual tree walk.

@@ -549,6 +549,13 @@ PyObject *node_get_descendant_count(Node *self, void *Py_UNUSED(payload)) {
     return PyLong_FromUnsignedLong(ts_node_descendant_count(self->node));
 }
 
+PyObject *node_get_tree(Node *self, void *Py_UNUSED(payload)) {
+    if (self->tree == NULL) {
+        Py_RETURN_NONE;
+    }
+    return Py_NewRef(self->tree);
+}
+
 PyObject *node_get_text(Node *self, void *Py_UNUSED(payload)) {
     Tree *tree = (Tree *)self->tree;
     if (tree == NULL) {
@@ -916,6 +923,7 @@ static PyGetSetDef node_accessors[] = {
      PyDoc_STR("This node's previous named sibling."), NULL},
     {"descendant_count", (getter)node_get_descendant_count, NULL,
      PyDoc_STR("This node's number of descendants, including the node itself."), NULL},
+    {"tree", (getter)node_get_tree, NULL, PyDoc_STR("The tree that this node belongs to."), NULL},
     {"text", (getter)node_get_text, NULL,
      PyDoc_STR("The text of the node, if the tree has not been edited"), NULL},
     {NULL},
